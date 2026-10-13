@@ -384,3 +384,18 @@ In the [`esempi/`](esempi) folder:
 - `funzioni.uc`: chaining, pipes, infix calls, closures, generators
 - `vita.uc`: Conway's Game of Life
 - `moduli.uc`: `import` and error handling
+
+## License
+
+Copyright (C) 2026 Stefano Benedet
+
+UniCo is free software, released under the **GNU General Public License,
+version 3 or later** ([`LICENSE`](LICENSE)). You can use, study, share and
+modify it; if you distribute it, modified or inside another program, you
+must release the complete source code under the same license.
+
+Programs **written in** UniCo are not covered by this license: they belong
+to their authors, who can license them however they like.
+
+For a different license (for example to embed UniCo in a closed product),
+contact the author.

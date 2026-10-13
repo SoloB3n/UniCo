@@ -1,5 +1,13 @@
 /*
  * UniCo — un codice unico.
+ * Copyright (C) 2026 Stefano Benedet
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Questo programma è software libero: puoi ridistribuirlo e/o modificarlo
+ * secondo i termini della GNU General Public License pubblicata dalla
+ * Free Software Foundation, versione 3 o (a tua scelta) successiva.
+ * È distribuito nella speranza che sia utile, ma SENZA ALCUNA GARANZIA.
+ * Vedi il file LICENSE per i dettagli.
  *
  * Interprete completo del linguaggio UniCo in un solo file C99,
  * senza dipendenze oltre alla libreria standard.
