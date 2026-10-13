@@ -8,7 +8,8 @@ fn ok(cond, nome) {
 # --- valori e operatori
 ok(1 + 2 * 3 == 7, "precedenza")
 ok(-7 % 3 == 2, "modulo sempre positivo")
-ok(0.1 + 0.2 != 0.3 and str(0.1 + 0.2) == "0.3", "stampa dei decimali")
+ok(0.1 + 0.2 != 0.3 and str(0.1 + 0.2) == "0.30000000000000004" and str(2.5) == "2.5", "stampa esatta dei decimali")
+ok(str(pow(2, 53)) == "9007199254740992" and str(1/3) == "0.3333333333333333", "stampa esatta dei numeri grandi")
 ok("a" + 1 == "a1", "concatenazione")
 ok("ab" * 3 == "ababab", "ripetizione")
 ok((nulla ?? 5) == 5, "??")

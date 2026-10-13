@@ -620,8 +620,15 @@ static void fmt_num(Buf *b, double d) {
     if (isnan(d)) buf_puts(b, "nan");
     else if (isinf(d)) buf_puts(b, d > 0 ? "inf" : "-inf");
     else {
-        if (d == floor(d) && fabs(d) < 1e15) snprintf(tmp, sizeof tmp, "%.0f", d == 0 ? 0.0 : d);
-        else snprintf(tmp, sizeof tmp, "%.14g", d);
+        /* interi esatti fino a 2^53; per gli altri numeri la scrittura più
+           corta che, riletta, dà esattamente lo stesso valore */
+        if (d == floor(d) && fabs(d) <= 9007199254740992.0) snprintf(tmp, sizeof tmp, "%.0f", d == 0 ? 0.0 : d);
+        else {
+            for (int prec = 15; prec <= 17; prec++) {
+                snprintf(tmp, sizeof tmp, "%.*g", prec, d);
+                if (strtod(tmp, NULL) == d) break;
+            }
+        }
         buf_puts(b, tmp);
     }
 }
@@ -2421,12 +2428,9 @@ static void json_enc(Buf *b, Value v, int indent, int level) {
     case T_NUM: {
         double d = v.u.n; char tmp[40];
         if (!isfinite(d)) { buf_puts(b, "null"); break; }
-        if (d == floor(d) && fabs(d) < 1e15) snprintf(tmp, sizeof tmp, "%.0f", d == 0 ? 0.0 : d);
-        else {
-            snprintf(tmp, sizeof tmp, "%.15g", d);
-            if (strtod(tmp, NULL) != d) snprintf(tmp, sizeof tmp, "%.17g", d);
-        }
-        buf_puts(b, tmp);
+        Buf nb = { 0 }; fmt_num(&nb, d);
+        buf_puts(b, nb.s); free(nb.s);
+        (void)tmp;
         break;
     }
     case T_STR: json_str(b, AS_STR(v)->chars, AS_STR(v)->len); break;
