@@ -38,7 +38,9 @@
 typedef enum { T_NIL, T_BOOL, T_NUM, T_STR, T_CELL, T_FUNC, T_NATIVE } VType;
 typedef enum { O_STR, O_CELL, O_FUNC, O_NATIVE, O_ENV } OType;
 
-typedef struct Obj { OType type; unsigned char marked, perm; struct Obj *next; } Obj;
+/* old = sopravvissuto ad almeno una raccolta; remembered = oggetto vecchio
+   che ha ricevuto un riferimento dopo l'ultima raccolta (vedi gc). */
+typedef struct Obj { OType type; unsigned char marked, perm, old, remembered; struct Obj *next; } Obj;
 typedef struct { VType t; union { int b; double n; Obj *o; } u; } Value;
 
 typedef struct { Obj h; size_t len; uint32_t hash; int ascii; char chars[]; } Str;
@@ -97,7 +99,11 @@ struct Node {
 enum { U_NONE, U_RETURN, U_BREAK, U_CONTINUE };
 
 static struct {
-    Obj *objects; size_t nobj, next_gc;
+    Obj *young, *old;                 /* oggetti nuovi e oggetti sopravvissuti */
+    size_t nobj, nyoung;              /* oggetti vivi in tutto / creati dall'ultima raccolta */
+    size_t bytes_after_gc, major_at;  /* memoria dopo l'ultima raccolta; soglia per una completa */
+    Obj **rem; int nrem, crem;        /* oggetti vecchi modificati (barriera di scrittura) */
+    int gc_major;
     Value stack[UC_STACK_MAX]; int sp;
     Env *envs[UC_DEPTH_MAX + 64]; int esp;
     Obj **gray; int ngray, cgray;
@@ -111,7 +117,7 @@ static struct {
     struct { const char *name, *file; int line; } frames[UC_DEPTH_MAX + 1];
     Buf trace;                        /* catena di chiamate dell'ultimo errore */
     Cell *modules;                    /* moduli già importati, per percorso */
-    size_t bytes, next_bytes;         /* memoria stimata in uso */
+    size_t bytes;                     /* memoria stimata in uso */
     /* limiti per eseguire codice non fidato */
     int sandbox, fatal;
     long steps, max_steps;
@@ -128,7 +134,7 @@ static Value eval(Node *n, Env *e);
 static Value eval_block(Node *b, Env *e);
 static Value call_value(Value f, int argc, Value *argv, Value self, int has_self);
 static void to_buf(void *b, Value v, int quote, int depth);
-static void gc(void);
+static void gc(int major);
 
 /* ================================================================== */
 /*  Utilità                                                            */
@@ -234,12 +240,30 @@ static void *gc_alloc(size_t sz, OType t) {
     mem_grow(sz);
     Obj *o = calloc(1, sz);
     if (!o) { fputs("unico: memoria esaurita\n", stderr); exit(1); }
-    o->type = t; o->next = vm.objects; vm.objects = o; vm.nobj++;
+    o->type = t; o->next = vm.young; vm.young = o;
+    vm.nobj++; vm.nyoung++;
     return o;
 }
 
+/* Barriera di scrittura: va chiamata prima di salvare un valore dentro una
+   cella. Se la cella è vecchia viene annotata, così la prossima raccolta
+   minore vede anche gli oggetti nuovi raggiungibili solo da lei. Le celle
+   sono gli unici oggetti modificabili: ambienti e funzioni non cambiano
+   i loro riferimenti dopo la creazione. */
+static void remember(Cell *c) {
+    c->h.remembered = 1;
+    if (vm.nrem == vm.crem) {
+        vm.crem = vm.crem ? vm.crem * 2 : 256;
+        vm.rem = xrealloc(vm.rem, vm.crem * sizeof(Obj *));
+    }
+    vm.rem[vm.nrem++] = &c->h;
+}
+/* il caso comune (cella nuova, o già annotata) costa un solo confronto */
+#define write_barrier(c) do { if ((c)->h.old && !(c)->h.remembered) remember(c); } while (0)
+
 static void mark_obj(Obj *o) {
     if (!o || o->marked) return;
+    if (o->old && !vm.gc_major) return;   /* raccolta minore: i vecchi restano */
     o->marked = 1;
     if (o->type == O_STR || o->type == O_NATIVE) return;
     if (vm.ngray == vm.cgray) {
@@ -279,6 +303,7 @@ static size_t obj_size(Obj *o) {
 
 static void free_obj(Obj *o) {
     vm.bytes -= obj_size(o);
+    vm.nobj--;
     if (o->type == O_CELL) {
         Cell *c = (Cell *)o;
         free(c->arr); free(c->ent); free(c->idx);
@@ -286,23 +311,55 @@ static void free_obj(Obj *o) {
     free(o);
 }
 
-static void gc(void) {
+/* Garbage collector generazionale, mark & sweep, senza spostare oggetti.
+   - Raccolta minore: segna solo gli oggetti nuovi, partendo dalle radici e
+     dalle celle vecchie modificate (annotate dalla barriera). I nuovi
+     sopravvissuti diventano vecchi. Costa in proporzione agli oggetti nuovi,
+     che di solito sono quasi tutti spazzatura.
+   - Raccolta completa (major): segna e spazza tutto. Parte solo quando la
+     memoria è raddoppiata dall'ultima raccolta completa. */
+static void gc(int major) {
+    vm.gc_major = major;
     mark_obj((Obj *)vm.globals);
     for (int i = 0; i < vm.sp; i++) mark_val(vm.stack[i]);
     for (int i = 0; i < vm.esp; i++) mark_obj((Obj *)vm.envs[i]);
     mark_val(vm.ret); mark_val(vm.errval);
     mark_obj((Obj *)vm.modules);
+    if (!major) for (int i = 0; i < vm.nrem; i++) blacken(vm.rem[i]);
     while (vm.ngray) blacken(vm.gray[--vm.ngray]);
-    Obj **p = &vm.objects;
-    while (*p) {
-        Obj *o = *p;
-        if (o->perm || o->marked) { o->marked = 0; p = &o->next; }
-        else { *p = o->next; free_obj(o); vm.nobj--; }
+    for (int i = 0; i < vm.nrem; i++) vm.rem[i]->remembered = 0;
+    vm.nrem = 0;
+    Obj *o;
+    /* prima i vecchi (solo nella raccolta completa): va fatto prima di
+       promuovere i nuovi, che a quel punto hanno già il segno azzerato */
+    if (major) {
+        Obj **p = &vm.old;
+        while (*p) {
+            o = *p;
+            if (o->marked || o->perm) { o->marked = 0; p = &o->next; }
+            else { *p = o->next; free_obj(o); }
+        }
     }
-    vm.next_gc = vm.nobj * 2 < 50000 ? 50000 : vm.nobj * 2;
-    vm.next_bytes = vm.bytes * 2 < (16u << 20) ? (16u << 20) : vm.bytes * 2;
-    if (vm.mem_limit && vm.next_bytes > vm.mem_limit) vm.next_bytes = vm.mem_limit;
+    /* i nuovi: liberati, oppure promossi tra i vecchi */
+    o = vm.young;
+    while (o) {
+        Obj *next = o->next;
+        if (o->marked || o->perm) { o->marked = 0; o->old = 1; o->next = vm.old; vm.old = o; }
+        else free_obj(o);
+        o = next;
+    }
+    vm.young = NULL; vm.nyoung = 0;
+    if (major) {
+        vm.major_at = vm.bytes * 2 < (32u << 20) ? (32u << 20) : vm.bytes * 2;
+        if (vm.mem_limit && vm.major_at > vm.mem_limit) vm.major_at = vm.mem_limit;
+    }
+    vm.bytes_after_gc = vm.bytes;
 }
+
+/* Quanti oggetti nuovi (o quanta memoria nuova) prima di una raccolta minore. */
+#define YOUNG_OBJS  100000
+#define YOUNG_BYTES (8u << 20)
+
 /* Punto sicuro: tra un'istruzione e l'altra. Qui gira il garbage collector
    e si controllano i limiti di passi, tempo e memoria. */
 static void safe_point(void) {
@@ -312,12 +369,14 @@ static void safe_point(void) {
         (double)(clock() - vm.t0) / CLOCKS_PER_SEC > vm.max_time)
         limit_error(L("superato il limite di tempo", "time limit exceeded"));
 #ifdef UC_GC_STRESS
-    gc();
+    /* per i test: una raccolta a ogni istruzione, completa una volta su 8 */
+    gc((vm.steps & 7) == 0);
 #else
-    if (vm.nobj >= vm.next_gc || vm.bytes >= vm.next_bytes) gc();
+    if (vm.nyoung >= YOUNG_OBJS || vm.bytes >= vm.bytes_after_gc + YOUNG_BYTES)
+        gc(vm.bytes >= vm.major_at);
 #endif
     if (vm.mem_limit && vm.bytes > vm.mem_limit) {
-        gc();
+        gc(1);
         if (vm.bytes > vm.mem_limit) limit_error(L("superato il limite di memoria", "memory limit exceeded"));
     }
 }
@@ -382,6 +441,7 @@ static size_t u8off(Str *s, long ci) {
 static Cell *cell_new(void) { return gc_alloc(sizeof(Cell), O_CELL); }
 
 static void cell_push(Cell *c, Value v) {
+    write_barrier(c);
     if (c->alen == c->acap) {
         int nc = c->acap ? c->acap * 2 : 4;
         mem_grow((nc - c->acap) * sizeof(Value));
@@ -451,6 +511,7 @@ static void cell_reindex(Cell *c) {
 }
 
 static void cell_set_key(Cell *c, Value k, Value v) {
+    write_barrier(c);
     int f = cell_find(c, k);
     if (f >= 0) { c->ent[f].val = v; return; }
     if (c->elen == c->ecap) {
@@ -500,7 +561,7 @@ static void cell_set(Cell *c, Value k, Value v) {
     long i;
     if (k.t == T_NUM && num_index(k.u.n, &i)) {
         long j = i < 0 ? i + c->alen : i;
-        if (j >= 0 && j < c->alen) { c->arr[j] = v; return; }
+        if (j >= 0 && j < c->alen) { write_barrier(c); c->arr[j] = v; return; }
         if (j == c->alen && cell_find(c, k) < 0) { cell_push(c, v); return; }
     }
     if (!key_ok(k)) rt_error(L("una chiave non può essere di tipo %s", "a key cannot be of type %s"), tname(k));
@@ -2600,7 +2661,7 @@ void uc_set(const char *name, Value v) { setv(vm.globals, str_intern(name, strle
 /* Limiti per codice non fidato (0 = nessun limite). Valgono per ogni uc_run. */
 void uc_limits(long max_steps, double max_seconds, size_t max_bytes) {
     vm.max_steps = max_steps; vm.max_time = max_seconds; vm.mem_limit = max_bytes;
-    if (max_bytes && vm.next_bytes > max_bytes) vm.next_bytes = max_bytes;
+    if (max_bytes && vm.major_at > max_bytes) vm.major_at = max_bytes;
 }
 
 /* Modalità protetta: niente file, importazioni né esci(). */
@@ -2645,7 +2706,7 @@ void uc_init(void) {
         if (!env || !*env) env = getenv("LANG");
     }
     vm.lang = lang_from(env) == LANG_IT ? LANG_IT : LANG_EN;
-    vm.next_gc = 50000;
+    vm.major_at = 32u << 20;
     vm.rng = (uint64_t)time(NULL) * 2654435761u + 88172645463325252ULL;
     vm.globals = env_new(NULL);
     vm.globals->h.perm = 1; vm.globals->vars->h.perm = 1;
