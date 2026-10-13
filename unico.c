@@ -21,7 +21,7 @@
 #include <string.h>
 #include <time.h>
 
-#define UC_VERSION   "0.2.0"
+#define UC_VERSION   "0.3.0"
 #define UC_STACK_MAX 65536
 #define UC_DEPTH_MAX 1800
 
@@ -79,7 +79,7 @@ typedef enum {
     N_NUM, N_STR, N_INTERP, N_IDENT, N_SELF, N_TRUE, N_FALSE, N_NIL, N_CELL,
     N_BLOCK, N_UNARY, N_BINARY, N_AND, N_OR, N_COALESCE, N_ASSIGN, N_CALL,
     N_INDEX, N_FIELD, N_FUNC, N_IF, N_WHILE, N_FOR, N_RANGE, N_MATCH, N_ARM,
-    N_WILD, N_RETURN, N_BREAK, N_CONTINUE
+    N_WILD, N_RETURN, N_BREAK, N_CONTINUE, N_SPREAD
 } NType;
 
 struct Node {
@@ -117,7 +117,12 @@ static struct {
     long steps, max_steps;
     double max_time; clock_t t0;
     size_t mem_limit;
+    int lang;                         /* lingua dei messaggi: LANG_IT o LANG_EN */
 } vm;
+
+enum { LANG_IT, LANG_EN };
+/* Ogni testo mostrato all'utente esiste in italiano e in inglese. */
+#define L(it, en) (vm.lang == LANG_EN ? (en) : (it))
 
 static Value eval(Node *n, Env *e);
 static Value eval_block(Node *b, Env *e);
@@ -180,9 +185,13 @@ static void capture_trace(void) {
     vm.trace.len = 0;
     if (vm.trace.s) vm.trace.s[0] = 0;
     for (int i = vm.depth - 1, shown = 0; i >= 0; i--, shown++) {
-        if (shown == 12) { buf_fmt(&vm.trace, "  ... e altre %d chiamate\n", i + 1); break; }
-        buf_fmt(&vm.trace, "  in %s, chiamata da %s:%d\n", vm.frames[i].name,
-                vm.frames[i].file ? vm.frames[i].file : "?", vm.frames[i].line);
+        if (shown == 12) { buf_fmt(&vm.trace, L("  ... e altre %d chiamate\n", "  ... and %d more calls\n"), i + 1); break; }
+        if (vm.frames[i].file)
+            buf_fmt(&vm.trace, L("  in %s, chiamata da %s:%d\n", "  in %s, called from %s:%d\n"),
+                    vm.frames[i].name, vm.frames[i].file, vm.frames[i].line);
+        else
+            buf_fmt(&vm.trace, L("  in %s, chiamata alla riga %d\n", "  in %s, called at line %d\n"),
+                    vm.frames[i].name, vm.frames[i].line);
     }
 }
 
@@ -191,7 +200,7 @@ NORET static void uc_throw(Value v) {
     capture_trace();
     if (vm.err) longjmp(*vm.err, 1);
     Buf b = { 0 }; to_buf(&b, v, 0, 0);
-    fprintf(stderr, "errore: %s\n", b.s ? b.s : "");
+    fprintf(stderr, "%s: %s\n", L("errore", "error"), b.s ? b.s : "");
     exit(1);
 }
 
@@ -199,7 +208,7 @@ NORET static void rt_error(const char *fmt, ...) {
     char msg[512], full[600];
     va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof msg, fmt, ap); va_end(ap);
     if (vm.file) snprintf(full, sizeof full, "%s:%d: %s", vm.file, vm.line, msg);
-    else snprintf(full, sizeof full, "riga %d: %s", vm.line, msg);
+    else snprintf(full, sizeof full, L("riga %d: %s", "line %d: %s"), vm.line, msg);
     uc_throw(VSTR(str_new(full, strlen(full))));
 }
 
@@ -218,7 +227,7 @@ NORET static void limit_error(const char *msg) {
    punti sicuri, dopo una raccolta). */
 static void mem_grow(size_t n) {
     vm.bytes += n;
-    if (vm.mem_limit && vm.bytes > vm.mem_limit * 2) limit_error("superato il limite di memoria");
+    if (vm.mem_limit && vm.bytes > vm.mem_limit * 2) limit_error(L("superato il limite di memoria", "memory limit exceeded"));
 }
 
 static void *gc_alloc(size_t sz, OType t) {
@@ -298,10 +307,10 @@ static void gc(void) {
    e si controllano i limiti di passi, tempo e memoria. */
 static void safe_point(void) {
     vm.steps++;
-    if (vm.max_steps && vm.steps > vm.max_steps) limit_error("superato il limite di passi");
+    if (vm.max_steps && vm.steps > vm.max_steps) limit_error(L("superato il limite di passi", "step limit exceeded"));
     if (vm.max_time > 0 && (vm.steps & 1023) == 0 &&
         (double)(clock() - vm.t0) / CLOCKS_PER_SEC > vm.max_time)
-        limit_error("superato il limite di tempo");
+        limit_error(L("superato il limite di tempo", "time limit exceeded"));
 #ifdef UC_GC_STRESS
     gc();
 #else
@@ -309,7 +318,7 @@ static void safe_point(void) {
 #endif
     if (vm.mem_limit && vm.bytes > vm.mem_limit) {
         gc();
-        if (vm.bytes > vm.mem_limit) limit_error("superato il limite di memoria");
+        if (vm.bytes > vm.mem_limit) limit_error(L("superato il limite di memoria", "memory limit exceeded"));
     }
 }
 #define MAYBE_GC() safe_point()
@@ -406,8 +415,16 @@ static int key_eq(Value a, Value b) {
     }
 }
 
+/* Fino a SMALL_MAP chiavi niente tabella hash: una ricerca lineare costa
+   meno (le variabili di una funzione sono quasi sempre poche, e i nomi
+   condivisi si confrontano per puntatore). */
+#define SMALL_MAP 8
+
 static int cell_find(Cell *c, Value k) {
-    if (!c->icap) return -1;
+    if (!c->icap) {
+        for (int i = 0; i < c->elen; i++) if (key_eq(c->ent[i].key, k)) return i;
+        return -1;
+    }
     uint32_t m = c->icap - 1, i = key_hash(k) & m;
     for (;;) {
         int e = c->idx[i];
@@ -443,6 +460,7 @@ static void cell_set_key(Cell *c, Value k, Value v) {
         c->ent = xrealloc(c->ent, c->ecap * sizeof(Entry));
     }
     c->ent[c->elen].key = k; c->ent[c->elen].val = v; c->elen++;
+    if (c->elen <= SMALL_MAP) return;
     if (c->elen * 2 > c->icap) cell_reindex(c); else cell_index_put(c, c->elen - 1);
 }
 
@@ -455,7 +473,9 @@ static int cell_get_key(Cell *c, Value k, Value *out) {
 static void cell_del_key(Cell *c, int f) {
     memmove(c->ent + f, c->ent + f + 1, (c->elen - f - 1) * sizeof(Entry));
     c->elen--;
-    cell_reindex(c);
+    if (c->elen > SMALL_MAP) { cell_reindex(c); return; }
+    vm.bytes -= c->icap * sizeof(int);
+    free(c->idx); c->idx = NULL; c->icap = 0;
 }
 
 static int num_index(double d, long *out) {
@@ -483,7 +503,7 @@ static void cell_set(Cell *c, Value k, Value v) {
         if (j >= 0 && j < c->alen) { c->arr[j] = v; return; }
         if (j == c->alen && cell_find(c, k) < 0) { cell_push(c, v); return; }
     }
-    if (!key_ok(k)) rt_error("una chiave non può essere di tipo %s", tname(k));
+    if (!key_ok(k)) rt_error(L("una chiave non può essere di tipo %s", "a key cannot be of type %s"), tname(k));
     cell_set_key(c, k, v);
 }
 
@@ -515,7 +535,7 @@ static Env *env_owner(Env *e, Str *name) {
 static void setv(Env *e, Str *name, Value v) { cell_set_key(e->vars, VSTR(name), v); }
 
 static void push(Value v) {
-    if (vm.sp >= UC_STACK_MAX) rt_error("pila esaurita");
+    if (vm.sp >= UC_STACK_MAX) rt_error(L("pila esaurita", "stack exhausted"));
     vm.stack[vm.sp++] = v;
 }
 
@@ -523,16 +543,14 @@ static void push(Value v) {
 /*  Operazioni sui valori                                              */
 /* ================================================================== */
 
-static const char *tname(Value v) {
-    switch (v.t) {
-    case T_NIL: return "nulla";
-    case T_BOOL: return "logico";
-    case T_NUM: return "numero";
-    case T_STR: return "testo";
-    case T_CELL: return "cella";
-    default: return "funzione";
-    }
+/* Nomi dei tipi: tipo() li dà sempre in italiano, type() sempre in
+   inglese, così un programma funziona allo stesso modo in ogni lingua. */
+static const char *tname_in(Value v, int lang) {
+    static const char *it[] = { "nulla", "logico", "numero", "testo", "cella", "funzione", "funzione" };
+    static const char *en[] = { "nil", "bool", "number", "string", "cell", "function", "function" };
+    return (lang == LANG_EN ? en : it)[v.t];
 }
+static const char *tname(Value v) { return tname_in(v, vm.lang); }
 
 static int truthy(Value v) { return !(v.t == T_NIL || (v.t == T_BOOL && !v.u.b)); }
 
@@ -569,8 +587,8 @@ static void quote_str(Buf *b, Str *s) {
 static void to_buf(void *bp, Value v, int q, int depth) {
     Buf *b = bp;
     switch (v.t) {
-    case T_NIL: buf_puts(b, "nulla"); break;
-    case T_BOOL: buf_puts(b, v.u.b ? "vero" : "falso"); break;
+    case T_NIL: buf_puts(b, L("nulla", "nil")); break;
+    case T_BOOL: buf_puts(b, v.u.b ? L("vero", "true") : L("falso", "false")); break;
     case T_NUM: fmt_num(b, v.u.n); break;
     case T_STR:
         if (q) quote_str(b, AS_STR(v));
@@ -602,12 +620,12 @@ static void to_buf(void *bp, Value v, int q, int depth) {
     }
     case T_FUNC: {
         Str *nm = AS_FUNC(v)->node->str;
-        buf_puts(b, "<funzione");
+        buf_puts(b, L("<funzione", "<function"));
         if (nm) { buf_putc(b, ' '); buf_puts(b, nm->chars); }
         buf_putc(b, '>');
         break;
     }
-    case T_NATIVE: buf_puts(b, "<funzione nativa "); buf_puts(b, AS_NAT(v)->name); buf_putc(b, '>'); break;
+    case T_NATIVE: buf_puts(b, L("<funzione nativa ", "<native function ")); buf_puts(b, AS_NAT(v)->name); buf_putc(b, '>'); break;
     }
 }
 
@@ -647,7 +665,7 @@ static int cmp_vals(Value a, Value b, int strict) {
         if (r) return r < 0 ? -1 : 1;
         return x->len < y->len ? -1 : x->len > y->len;
     }
-    if (strict) rt_error("impossibile confrontare %s con %s", tname(a), tname(b));
+    if (strict) rt_error(L("impossibile confrontare %s con %s", "cannot compare %s with %s"), tname(a), tname(b));
     return a.t < b.t ? -1 : a.t > b.t;
 }
 
@@ -662,7 +680,7 @@ static int contains(Value c, Value x) {
         return key_ok(x) && cell_find(k, x) >= 0;
     }
     if (c.t == T_NIL) return 0;
-    rt_error("'in' non funziona su %s", tname(c));
+    rt_error(L("'in' non funziona su %s", "'in' does not work on %s"), tname(c));
 }
 
 /* Token: definiti qui perché gli operatori binari usano gli stessi codici. */
@@ -674,7 +692,7 @@ static int contains(Value c, Value x) {
     X(EQ, "=") X(EQEQ, "==") X(NE, "!=") X(LT, "<") X(LE, "<=") X(GT, ">") X(GE, ">=") \
     X(PLUSEQ, "+=") X(MINUSEQ, "-=") X(STAREQ, "*=") X(SLASHEQ, "/=") X(BANG, "!") \
     X(ANDAND, "&&") X(OROR, "||") X(PIPE, "|") X(PIPEGT, "|>") X(ARROW, "=>") \
-    X(DOTDOT, "..") X(DOTDOTLT, "..<") X(QQ, "??") X(CARET, "^") \
+    X(DOTDOT, "..") X(DOTDOTLT, "..<") X(QQ, "??") X(CARET, "^") X(ELLIPSIS, "...") \
     X(IF, "se/if") X(ELSE, "altrimenti/else") X(WHILE, "mentre/while") X(FOR, "per/for") \
     X(IN, "in") X(FN, "fn") X(RETURN, "ritorna/return") X(BREAK, "basta/break") \
     X(CONTINUE, "continua/continue") X(TRUE, "vero/true") X(FALSE, "falso/false") \
@@ -683,6 +701,20 @@ static int contains(Value c, Value x) {
 #define X_NAME(a, b) b,
 typedef enum { TOKENS(X_ENUM) TK__COUNT } Tk;
 static const char *TKN[] = { TOKENS(X_NAME) };
+
+static const char *tkname(int t) {
+    if (vm.lang == LANG_EN) switch (t) {
+        case TK_EOF: return "end of file";
+        case TK_NL: return "newline";
+        case TK_NUM: return "number";
+        case TK_STR: return "string";
+        case TK_IDENT: return "name";
+        case TK_SELFF: return "@field";
+        case TK_INFIX: return "`infix`";
+        default: break;
+    }
+    return TKN[t];
+}
 
 static Value binop(int op, Value a, Value b) {
     switch (op) {
@@ -703,14 +735,14 @@ static Value binop(int op, Value a, Value b) {
     case TK_STAR:
         if (a.t == T_NUM && b.t == T_NUM) return vnum(a.u.n * b.u.n);
         if (a.t == T_STR && b.t == T_NUM) {
-            if (vm.mem_limit && AS_STR(a)->len * b.u.n > (double)vm.mem_limit) limit_error("superato il limite di memoria");
+            if (vm.mem_limit && AS_STR(a)->len * b.u.n > (double)vm.mem_limit) limit_error(L("superato il limite di memoria", "memory limit exceeded"));
             Buf bf = { 0 };
             for (long i = 0; i < (long)b.u.n; i++) buf_put(&bf, AS_STR(a)->chars, AS_STR(a)->len);
             return vbuf(&bf);
         }
         if (a.t == T_CELL && b.t == T_NUM) {
             if (vm.mem_limit && AS_CELL(a)->alen * b.u.n * sizeof(Value) > (double)vm.mem_limit)
-                limit_error("superato il limite di memoria");
+                limit_error(L("superato il limite di memoria", "memory limit exceeded"));
             Cell *c = cell_new(), *x = AS_CELL(a);
             for (long i = 0; i < (long)b.u.n; i++)
                 for (int j = 0; j < x->alen; j++) cell_push(c, x->arr[j]);
@@ -733,14 +765,14 @@ static Value binop(int op, Value a, Value b) {
     case TK_GE: return vbool(cmp_vals(a, b, 1) >= 0);
     case TK_IN: return vbool(contains(b, a));
     }
-    rt_error("operazione '%s' non valida tra %s e %s", TKN[op], tname(a), tname(b));
+    rt_error(L("operazione '%s' non valida tra %s e %s", "invalid operation '%s' between %s and %s"), tkname(op), tname(a), tname(b));
 }
 
 static Value index_get(Value o, Value k) {
     if (o.t == T_CELL) return cell_get(AS_CELL(o), k);
     if (o.t == T_STR) {
         long i; Str *s = AS_STR(o);
-        if (k.t != T_NUM || !num_index(k.u.n, &i)) rt_error("un testo si indicizza con un numero intero");
+        if (k.t != T_NUM || !num_index(k.u.n, &i)) rt_error(L("un testo si indicizza con un numero intero", "a string must be indexed with an integer"));
         long n = u8count(s);
         if (i < 0) i += n;
         if (i < 0 || i >= n) return VNIL;
@@ -749,11 +781,11 @@ static Value index_get(Value o, Value k) {
         if (off + l > s->len) l = s->len - off;
         return VSTR(str_new(s->chars + off, l));
     }
-    rt_error("impossibile indicizzare un valore di tipo %s", tname(o));
+    rt_error(L("impossibile indicizzare un valore di tipo %s", "cannot index a value of type %s"), tname(o));
 }
 
 static void index_set(Value o, Value k, Value v) {
-    if (o.t != T_CELL) rt_error("si possono modificare solo le celle, non %s", tname(o));
+    if (o.t != T_CELL) rt_error(L("si possono modificare solo le celle, non %s", "only cells can be modified, not %s"), tname(o));
     cell_set(AS_CELL(o), k, v);
 }
 
@@ -779,7 +811,7 @@ static const struct { const char *w; Tk t; } KW[] = {
 };
 
 static const struct { const char *s; Tk t; } OPS[] = {
-    { "..<", TK_DOTDOTLT }, { "==", TK_EQEQ }, { "!=", TK_NE }, { "<=", TK_LE }, { ">=", TK_GE },
+    { "...", TK_ELLIPSIS }, { "..<", TK_DOTDOTLT }, { "==", TK_EQEQ }, { "!=", TK_NE }, { "<=", TK_LE }, { ">=", TK_GE },
     { "+=", TK_PLUSEQ }, { "-=", TK_MINUSEQ }, { "*=", TK_STAREQ }, { "/=", TK_SLASHEQ },
     { "&&", TK_ANDAND }, { "||", TK_OROR }, { "|>", TK_PIPEGT }, { "=>", TK_ARROW },
     { "..", TK_DOTDOT }, { "??", TK_QQ },
@@ -883,9 +915,13 @@ static void lex(const char *src, size_t len, int line, TokVec *tv) {
                 p++;
             }
             if (p >= end)
-                lex_error(L, depth > 0 ? "testo non terminato: c'è una '{' aperta "
-                                         "(per scrivere una graffa nel testo usa \\{ oppure gli apici '...')"
-                                       : "testo non terminato: manca la virgoletta di chiusura");
+                lex_error(L, depth > 0
+                    ? L("testo non terminato: c'è una '{' aperta (per scrivere una graffa "
+                        "nel testo usa \\{ oppure gli apici '...')",
+                        "unterminated string: there is an open '{' (to write a brace "
+                        "in a string use \\{ or single quotes '...')")
+                    : L("testo non terminato: manca la virgoletta di chiusura",
+                        "unterminated string: the closing quote is missing"));
             Token *t = emit(tv, TK_STR, L);
             t->raw = (const char *)s; t->rawlen = (int)(p - s); t->interp = q == '"';
             p++;
@@ -913,7 +949,7 @@ static void lex(const char *src, size_t len, int line, TokVec *tv) {
         if (c == '`') {
             const unsigned char *s = ++p;
             while (p < end && is_id(*p)) p++;
-            if (p >= end || *p != '`' || p == s) lex_error(L, "infisso non valido: usa `nome`");
+            if (p >= end || *p != '`' || p == s) lex_error(L, L("infisso non valido: usa `nome`", "invalid infix: use `name`"));
             emit(tv, TK_INFIX, L)->s = str_intern((const char *)s, p - s);
             p++;
             continue;
@@ -924,7 +960,7 @@ static void lex(const char *src, size_t len, int line, TokVec *tv) {
             if ((size_t)(end - p) >= n && memcmp(p, OPS[i].s, n) == 0) {
                 Tk t = OPS[i].t;
                 if (t == TK_LP || t == TK_LB || t == TK_LC) {
-                    if (sd >= 255) lex_error(L, "troppe parentesi annidate");
+                    if (sd >= 255) lex_error(L, L("troppe parentesi annidate", "too many nested brackets"));
                     st[sd++] = (char)OPS[i].s[0];
                 } else if (t == TK_RP || t == TK_RB || t == TK_RC) {
                     if (sd) sd--;
@@ -936,7 +972,7 @@ static void lex(const char *src, size_t len, int line, TokVec *tv) {
             }
         }
         if (!found) {
-            char msg[64]; snprintf(msg, sizeof msg, "carattere inatteso '%c'", c);
+            char msg[64]; snprintf(msg, sizeof msg, L("carattere inatteso '%c'", "unexpected character '%c'"), c);
             lex_error(L, msg);
         }
     }
@@ -956,7 +992,7 @@ static int acc(P *p, Tk t) { if (pt(p) == t) { adv(p); return 1; } return 0; }
 
 NORET static void syn(P *p, const char *what) {
     vm.line = p->t[p->i].line;
-    rt_error("errore di sintassi: atteso %s, trovato '%s'", what, TKN[pt(p)]);
+    rt_error(L("errore di sintassi: atteso %s, trovato '%s'", "syntax error: expected %s, found '%s'"), what, tkname(pt(p)));
 }
 static Token *expect(P *p, Tk t, const char *what) { if (pt(p) != t) syn(p, what); return adv(p); }
 
@@ -1002,6 +1038,8 @@ static Node *parse_block(P *p);
 static Node *parse_postfix(P *p);
 static Node *parse_range(P *p);
 static Node *parse_program(P *p);
+static Node *parse_or(P *p);
+static Node *parse_spread_or_expr(P *p);
 
 static Node *parse_string(Token *t) {
     Buf lit = { 0 }; Node *parts = NULL;
@@ -1031,7 +1069,7 @@ static Node *parse_string(Token *t) {
             }
             if (j >= n) {
                 vm.line = t->line;
-                rt_error("'{' senza '}' nel testo (per scrivere una graffa usa \\{ oppure gli apici '...')");
+                rt_error(L("'{' senza '}' nel testo (per scrivere una graffa usa \\{ oppure gli apici '...')", "'{' without '}' in string (to write a brace use \\{ or single quotes '...')"));
             }
             if (!parts) parts = nn(N_INTERP, t->line);
             if (lit.len) {
@@ -1044,7 +1082,7 @@ static Node *parse_string(Token *t) {
             while (pt(&sp) == TK_NL) adv(&sp);
             Node *e = parse_expr(&sp);
             while (pt(&sp) == TK_NL) adv(&sp);
-            if (pt(&sp) != TK_EOF) syn(&sp, "'}' a fine espressione");
+            if (pt(&sp) != TK_EOF) syn(&sp, L("'}' a fine espressione", "'}' after the expression"));
             free(tv.v);
             addk(parts, e, NULL);
             i = j;
@@ -1066,9 +1104,20 @@ static Node *parse_string(Token *t) {
     return parts;
 }
 
+/* Parametri: "a", "b = valore predefinito", "...resto" (solo per ultimo).
+   I valori predefiniti stanno in f->kids, uno per parametro (o NULL);
+   f->flag = 1 se l'ultimo parametro raccoglie gli argomenti in più. */
 static void parse_params(P *p, Node *f, Tk close) {
     if (acc(p, close)) return;
-    do { addname(f, expect(p, TK_IDENT, "nome di parametro")->s); } while (acc(p, TK_COMMA));
+    do {
+        if (f->flag) syn(p, L("nient'altro dopo il parametro '...'", "nothing after the '...' parameter"));
+        int rest = acc(p, TK_ELLIPSIS);
+        addname(f, expect(p, TK_IDENT, L("nome di parametro", "a parameter name"))->s);
+        Node *def = NULL;
+        if (!rest && acc(p, TK_EQ)) def = parse_or(p);
+        addk(f, def, NULL);
+        if (rest) f->flag = 1;
+    } while (acc(p, TK_COMMA));
     expect(p, close, close == TK_PIPE ? "'|'" : "')'");
 }
 
@@ -1095,10 +1144,10 @@ static Node *parse_cell(P *p, Token *t) {
             else if (k->t == TK_IDENT) { key = nn(N_STR, k->line); key->str = k->s; }
             else {
                 key = parse_string(k);
-                if (key->t != N_STR) { vm.line = k->line; rt_error("una chiave non può contenere {interpolazioni}"); }
+                if (key->t != N_STR) { vm.line = k->line; rt_error(L("una chiave non può contenere {interpolazioni}", "a key cannot contain {interpolations}")); }
             }
         }
-        addk(n, parse_expr(p), key);
+        addk(n, key ? parse_expr(p) : parse_spread_or_expr(p), key);
         if (!acc(p, TK_COMMA)) break;
     }
     expect(p, TK_RB, "']'");
@@ -1150,7 +1199,7 @@ static Node *parse_primary(P *p) {
     case TK_IDENT: n = nn(N_IDENT, t->line); n->str = t->s; return n;
     case TK_CARET:
         n = nn(N_IDENT, t->line);
-        n->str = expect(p, TK_IDENT, "nome dopo '^'")->s; n->flag = 1;
+        n->str = expect(p, TK_IDENT, L("nome dopo '^'", "a name after '^'"))->s; n->flag = 1;
         return n;
     case TK_AT: return nn(N_SELF, t->line);
     case TK_SELFF:
@@ -1186,8 +1235,8 @@ static Node *parse_primary(P *p) {
         return n;
     case TK_FOR:
         n = nn(N_FOR, t->line);
-        addname(n, expect(p, TK_IDENT, "nome di variabile")->s);
-        if (acc(p, TK_COMMA)) addname(n, expect(p, TK_IDENT, "nome di variabile")->s);
+        addname(n, expect(p, TK_IDENT, L("nome di variabile", "a variable name"))->s);
+        if (acc(p, TK_COMMA)) addname(n, expect(p, TK_IDENT, L("nome di variabile", "a variable name"))->s);
         expect(p, TK_IN, "'in'");
         n->a = parse_expr(p);
         n->b = parse_block(p);
@@ -1202,8 +1251,16 @@ static Node *parse_primary(P *p) {
     case TK_CONTINUE: return nn(N_CONTINUE, t->line);
     default:
         if (t->t != TK_EOF) p->i--;
-        syn(p, "un'espressione");
+        syn(p, L("un'espressione", "an expression"));
     }
+}
+
+/* "...espressione" dentro una chiamata o una cella: espande una cella. */
+static Node *parse_spread_or_expr(P *p) {
+    if (pt(p) != TK_ELLIPSIS) return parse_expr(p);
+    Node *n = nn(N_SPREAD, adv(p)->line);
+    n->a = parse_expr(p);
+    return n;
 }
 
 static Node *parse_postfix(P *p) {
@@ -1213,7 +1270,7 @@ static Node *parse_postfix(P *p) {
         if (t == TK_LP) {
             Node *c = nn(N_CALL, adv(p)->line); c->a = n;
             while (pt(p) != TK_RP) {
-                addk(c, parse_expr(p), NULL);
+                addk(c, parse_spread_or_expr(p), NULL);
                 if (!acc(p, TK_COMMA)) break;
             }
             expect(p, TK_RP, "')'");
@@ -1225,7 +1282,7 @@ static Node *parse_postfix(P *p) {
             n = x;
         } else if (t == TK_DOT) {
             Node *x = nn(N_FIELD, adv(p)->line); x->a = n;
-            x->str = expect(p, TK_IDENT, "nome di campo dopo '.'")->s;
+            x->str = expect(p, TK_IDENT, L("nome di campo dopo '.'", "a field name after '.'"))->s;
             n = x;
         } else break;
     }
@@ -1332,7 +1389,7 @@ static Node *parse_expr(P *p) {
     Node *l = parse_pipe(p);
     Tk t = pt(p);
     if (t == TK_EQ || t == TK_PLUSEQ || t == TK_MINUSEQ || t == TK_STAREQ || t == TK_SLASHEQ) {
-        if (l->t != N_IDENT && l->t != N_INDEX && l->t != N_FIELD) syn(p, "un nome, un indice o un campo prima di '='");
+        if (l->t != N_IDENT && l->t != N_INDEX && l->t != N_FIELD) syn(p, L("un nome, un indice o un campo prima di '='", "a name, an index or a field before '='"));
         Token *k = adv(p);
         return bin(N_ASSIGN, t, l, parse_expr(p), k->line);
     }
@@ -1343,10 +1400,10 @@ static void parse_stmts(P *p, Node *blk, Tk end) {
     for (;;) {
         while (pt(p) == TK_NL || pt(p) == TK_SEMI) adv(p);
         if (pt(p) == end) break;
-        if (pt(p) == TK_EOF) syn(p, end == TK_RC ? "'}'" : "fine del file");
+        if (pt(p) == TK_EOF) syn(p, end == TK_RC ? "'}'" : L("fine del file", "end of file"));
         addk(blk, parse_expr(p), NULL);
         Tk t = pt(p);
-        if (t != TK_NL && t != TK_SEMI && t != end) syn(p, "fine dell'istruzione");
+        if (t != TK_NL && t != TK_SEMI && t != end) syn(p, L("fine dell'istruzione", "end of statement"));
     }
 }
 static Node *parse_block(P *p) {
@@ -1367,7 +1424,7 @@ static Node *parse_program(P *p) {
 
 static void range_eval(Node *r, Env *e, double *a, double *b) {
     Value x = eval(r->a, e), y = eval(r->b, e);
-    if (x.t != T_NUM || y.t != T_NUM) rt_error("gli estremi di un intervallo devono essere numeri");
+    if (x.t != T_NUM || y.t != T_NUM) rt_error(L("gli estremi di un intervallo devono essere numeri", "range bounds must be numbers"));
     *a = x.u.n; *b = y.u.n;
 }
 static int in_range(double x, double a, double b, int excl) {
@@ -1396,7 +1453,7 @@ static Value eval_for(Node *n, Env *e) {
         if (fresh) { \
             le = env_new(e); le->loop = 1; \
             if (slot < 0) { \
-                if (vm.esp >= UC_DEPTH_MAX + 60) rt_error("cicli annidati troppo profondi"); \
+                if (vm.esp >= UC_DEPTH_MAX + 60) rt_error(L("cicli annidati troppo profondi", "loops nested too deeply")); \
                 slot = vm.esp++; \
             } \
             vm.envs[slot] = le; \
@@ -1449,7 +1506,7 @@ static Value eval_for(Node *n, Env *e) {
         }
         break;
     default:
-        rt_error("impossibile iterare su un valore di tipo %s", tname(it));
+        rt_error(L("impossibile iterare su un valore di tipo %s", "cannot iterate over a value of type %s"), tname(it));
     }
 done:
     vm.sp = base;
@@ -1471,7 +1528,7 @@ static Value eval_call(Node *n, Env *e) {
         if (m.t != T_NIL) { fn = m; self = obj; has_self = 1; }
         else if (!env_lookup(e, cal->str, &fn)) {
             vm.line = n->line;
-            rt_error("'%s' non è né un campo di %s né una funzione", cal->str->chars, tname(obj));
+            rt_error(L("'%s' non è né un campo di %s né una funzione", "'%s' is neither a field of %s nor a function"), cal->str->chars, tname(obj));
         }
         vm.sp = base;
         push(fn); push(obj);
@@ -1484,9 +1541,15 @@ static Value eval_call(Node *n, Env *e) {
         argstart = vm.sp;
     }
     for (int i = 0; i < n->nk; i++) {
-        Value v = eval(n->kids[i], e);
+        Node *k = n->kids[i];
+        Value v = eval(k->t == N_SPREAD ? k->a : k, e);
         if (vm.unwind) { vm.sp = base; return v; }
-        push(v);
+        if (k->t == N_SPREAD) {
+            if (v.t == T_NIL) continue;
+            if (v.t != T_CELL) rt_error(L("'...' si usa solo con una cella, non %s", "'...' only works on a cell, not %s"), tname(v));
+            Cell *c = AS_CELL(v);
+            for (int j = 0; j < c->alen; j++) push(c->arr[j]);
+        } else push(v);
     }
     vm.line = n->line;
     Value r = call_value(fn, vm.sp - argstart, &vm.stack[argstart], self, has_self);
@@ -1505,13 +1568,13 @@ static Value eval_assign(Node *n, Env *e) {
         while (target->loop && !cell_get_key(target->vars, VSTR(t->str), &dummy)) target = target->parent;
         if (t->flag == 1) {
             target = env_owner(e->parent, t->str);
-            if (!target) rt_error("nessuna variabile esterna chiamata '%s'", t->str->chars);
+            if (!target) rt_error(L("nessuna variabile esterna chiamata '%s'", "no outer variable named '%s'"), t->str->chars);
         }
         Value v = eval(n->b, e);
         if (vm.unwind) return v;
         if (bop) {
             Value cur;
-            if (!env_lookup(target, t->str, &cur)) rt_error("nome non definito: '%s'", t->str->chars);
+            if (!env_lookup(target, t->str, &cur)) rt_error(L("nome non definito: '%s'", "undefined name: '%s'"), t->str->chars);
             v = binop(bop, cur, v);
         }
         setv(target, t->str, v);
@@ -1621,7 +1684,7 @@ static Value eval(Node *n, Env *e) {
     case N_IDENT: {
         Value v;
         if (!env_lookup(n->flag == 1 ? e->parent : e, n->str, &v))
-            rt_error("nome non definito: '%s'", n->str->chars);
+            rt_error(L("nome non definito: '%s'", "undefined name: '%s'"), n->str->chars);
         return v;
     }
     case N_SELF: {
@@ -1633,10 +1696,17 @@ static Value eval(Node *n, Env *e) {
         int base = vm.sp;
         push(VCELL(c));
         for (int i = 0; i < n->nk; i++) {
-            Value v = eval(n->kids[i], e);
+            Node *x = n->kids[i];
+            Value v = eval(x->t == N_SPREAD ? x->a : x, e);
             if (vm.unwind) { vm.sp = base; return v; }
             Node *k = n->keys[i];
-            if (k) cell_set(c, k->t == N_NUM ? vnum(k->num) : VSTR(k->str), v);
+            if (x->t == N_SPREAD) {
+                if (v.t == T_NIL) continue;
+                if (v.t != T_CELL) rt_error(L("'...' si usa solo con una cella, non %s", "'...' only works on a cell, not %s"), tname(v));
+                Cell *s = AS_CELL(v);
+                for (int j = 0; j < s->alen; j++) cell_push(c, s->arr[j]);
+                for (int j = 0; j < s->elen; j++) cell_set_key(c, s->ent[j].key, s->ent[j].val);
+            } else if (k) cell_set(c, k->t == N_NUM ? vnum(k->num) : VSTR(k->str), v);
             else cell_push(c, v);
         }
         vm.sp = base;
@@ -1647,7 +1717,7 @@ static Value eval(Node *n, Env *e) {
         Value v = eval(n->a, e);
         if (vm.unwind) return v;
         if (n->op == '-') {
-            if (v.t != T_NUM) rt_error("'-' richiede un numero, non %s", tname(v));
+            if (v.t != T_NUM) rt_error(L("'-' richiede un numero, non %s", "'-' needs a number, not %s"), tname(v));
             return vnum(-v.u.n);
         }
         return vbool(!truthy(v));
@@ -1689,7 +1759,7 @@ static Value eval(Node *n, Env *e) {
         Value o = eval(n->a, e);
         if (vm.unwind) return o;
         if (o.t == T_CELL) return cell_get(AS_CELL(o), VSTR(n->str));
-        rt_error("impossibile leggere il campo '%s' da un valore di tipo %s", n->str->chars, tname(o));
+        rt_error(L("impossibile leggere il campo '%s' da un valore di tipo %s", "cannot read field '%s' of a value of type %s"), n->str->chars, tname(o));
     }
     case N_FUNC: {
         Func *f = gc_alloc(sizeof(Func), O_FUNC);
@@ -1716,7 +1786,7 @@ static Value eval(Node *n, Env *e) {
     case N_RANGE: {
         double a, b; range_eval(n, e, &a, &b);
         int ex = n->op == TK_DOTDOTLT; double st = a <= b ? 1 : -1;
-        if (fabs(b - a) > 1e8) rt_error("intervallo troppo grande");
+        if (fabs(b - a) > 1e8) rt_error(L("intervallo troppo grande", "range too large"));
         Cell *c = cell_new();
         for (double i = a; st > 0 ? (ex ? i < b : i <= b) : (ex ? i > b : i >= b); i += st) cell_push(c, vnum(i));
         return VCELL(c);
@@ -1730,7 +1800,7 @@ static Value eval(Node *n, Env *e) {
     }
     case N_BREAK: vm.unwind = U_BREAK; return VNIL;
     case N_CONTINUE: vm.unwind = U_CONTINUE; return VNIL;
-    default: rt_error("nodo inatteso");
+    default: rt_error(L("nodo inatteso", "unexpected node"));
     }
 }
 
@@ -1746,17 +1816,30 @@ static Value eval_block(Node *b, Env *e) {
 
 static Value call_value(Value f, int argc, Value *argv, Value self, int has_self) {
     if (f.t == T_NATIVE) return AS_NAT(f)->fn(argc, argv);
-    if (f.t != T_FUNC) rt_error("impossibile chiamare un valore di tipo %s", tname(f));
+    if (f.t != T_FUNC) rt_error(L("impossibile chiamare un valore di tipo %s", "cannot call a value of type %s"), tname(f));
     Func *fn = AS_FUNC(f);
     Node *d = fn->node;
-    if (vm.depth >= UC_DEPTH_MAX) rt_error("ricorsione troppo profonda");
+    if (vm.depth >= UC_DEPTH_MAX) rt_error(L("ricorsione troppo profonda", "recursion too deep"));
     Env *ne = env_new(fn->env);
-    vm.frames[vm.depth].name = d->str ? d->str->chars : "<funzione anonima>";
+    vm.frames[vm.depth].name = d->str ? d->str->chars : L("<funzione anonima>", "<anonymous function>");
     vm.frames[vm.depth].file = vm.file;
     vm.frames[vm.depth].line = vm.line;
     vm.envs[vm.esp++] = ne; vm.depth++;
-    for (int i = 0; i < d->nn; i++) setv(ne, d->names[i], i < argc ? argv[i] : VNIL);
     if (has_self) setv(ne, vm.s_self, self);
+    int fixed = d->flag ? d->nn - 1 : d->nn;
+    for (int i = 0; i < fixed; i++) setv(ne, d->names[i], i < argc ? argv[i] : VNIL);
+    if (d->flag) {
+        Cell *rest = cell_new();
+        for (int i = fixed; i < argc; i++) cell_push(rest, argv[i]);
+        setv(ne, d->names[fixed], VCELL(rest));
+    }
+    /* valori predefiniti: valutati nella chiamata, per gli argomenti mancanti
+       o nulli; possono usare i parametri precedenti */
+    for (int i = 0; i < fixed; i++) {
+        if (!d->kids[i] || (i < argc && argv[i].t != T_NIL)) continue;
+        Value dv = eval(d->kids[i], ne);
+        setv(ne, d->names[i], dv);
+    }
     int line = vm.line; const char *file = vm.file;
     Value r = d->a->t == N_BLOCK ? eval_block(d->a, ne) : eval(d->a, ne);
     if (vm.unwind == U_RETURN) r = vm.ret;
@@ -1814,17 +1897,17 @@ static void deny(const char *fn);
 
 static double need_num(int argc, Value *argv, int i, const char *fn) {
     Value v = ARG(i);
-    if (v.t != T_NUM) rt_error("%s: l'argomento %d deve essere un numero, non %s", fn, i + 1, tname(v));
+    if (v.t != T_NUM) rt_error(L("%s: l'argomento %d deve essere un numero, non %s", "%s: argument %d must be a number, not %s"), fn, i + 1, tname(v));
     return v.u.n;
 }
 static Str *need_str(int argc, Value *argv, int i, const char *fn) {
     Value v = ARG(i);
-    if (v.t != T_STR) rt_error("%s: l'argomento %d deve essere un testo, non %s", fn, i + 1, tname(v));
+    if (v.t != T_STR) rt_error(L("%s: l'argomento %d deve essere un testo, non %s", "%s: argument %d must be a string, not %s"), fn, i + 1, tname(v));
     return AS_STR(v);
 }
 static Cell *need_cell(int argc, Value *argv, int i, const char *fn) {
     Value v = ARG(i);
-    if (v.t != T_CELL) rt_error("%s: l'argomento %d deve essere una cella, non %s", fn, i + 1, tname(v));
+    if (v.t != T_CELL) rt_error(L("%s: l'argomento %d deve essere una cella, non %s", "%s: argument %d must be a cell, not %s"), fn, i + 1, tname(v));
     return AS_CELL(v);
 }
 
@@ -1858,13 +1941,32 @@ NAT(n_num) {
     while (isspace((unsigned char)*end)) end++;
     return *end ? VNIL : vnum(d);
 }
-NAT(n_type) { return vstr(tname(ARG(0))); }
+NAT(n_type) { return vstr(tname_in(ARG(0), LANG_EN)); }
+NAT(n_tipo) { return vstr(tname_in(ARG(0), LANG_IT)); }
+
+/* Sceglie la lingua da un nome: "it", "italiano", "it_IT.UTF-8"... */
+static int lang_from(const char *s) {
+    if (!s || !*s) return -1;
+    if (!strncmp(s, "it", 2)) return LANG_IT;
+    if (!strncmp(s, "en", 2) || !strcmp(s, "C") || !strcmp(s, "POSIX")) return LANG_EN;
+    return -2;   /* lingua non disponibile */
+}
+/* lingua() restituisce la lingua attuale; lingua("en") la cambia. */
+NAT(n_lang) {
+    if (argc && argv[0].t != T_NIL) {
+        int l = lang_from(need_str(argc, argv, 0, "language")->chars);
+        if (l < 0) rt_error(L("lingua non disponibile: '%s' (disponibili: it, en)",
+                              "language not available: '%s' (available: it, en)"), AS_STR(argv[0])->chars);
+        vm.lang = l;
+    }
+    return vstr(vm.lang == LANG_EN ? "en" : "it");
+}
 NAT(n_len) {
     Value v = ARG(0);
     if (v.t == T_STR) return vnum((double)u8count(AS_STR(v)));
     if (v.t == T_CELL) return vnum(AS_CELL(v)->alen + AS_CELL(v)->elen);
     if (v.t == T_NIL) return vnum(0);
-    rt_error("len: %s non ha una lunghezza", tname(v));
+    rt_error(L("len: %s non ha una lunghezza", "len: %s has no length"), tname(v));
 }
 NAT(n_push) {
     Cell *c = need_cell(argc, argv, 0, "push");
@@ -2121,8 +2223,8 @@ NAT(n_time) { (void)argc; (void)argv; return vnum((double)time(NULL)); }
 NAT(n_error) { uc_throw(argc ? argv[0] : vstr("errore")); }
 NAT(n_assert) {
     if (truthy(ARG(0))) return vbool(1);
-    if (argc > 1) rt_error("verifica fallita: %s", AS_STR(tostr(argv[1]))->chars);
-    rt_error("verifica fallita");
+    if (argc > 1) rt_error(L("verifica fallita: %s", "assertion failed: %s"), AS_STR(tostr(argv[1]))->chars);
+    rt_error(L("verifica fallita", "assertion failed"));
 }
 NAT(n_try) {
     Value f = ARG(0), h = ARG(1);
@@ -2162,7 +2264,7 @@ NAT(n_write_file) {
     return vbool(w == AS_STR(data)->len);
 }
 static void deny(const char *fn) {
-    if (vm.sandbox) rt_error("%s: non disponibile in modalità protetta", fn);
+    if (vm.sandbox) rt_error(L("%s: non disponibile in modalità protetta", "%s: not available in sandbox mode"), fn);
 }
 
 /* importa("x") cerca prima accanto al file che lo chiama, poi nella
@@ -2188,10 +2290,10 @@ NAT(n_import) {
         }
     }
     free(dir.s);
-    if (!src) { free(full.s); rt_error("import: impossibile trovare '%s'", path->chars); }
+    if (!src) { free(full.s); rt_error(L("import: impossibile trovare '%s'", "import: cannot find '%s'"), path->chars); }
     Value key = vbuf(&full), cached;
     if (cell_get_key(vm.modules, key, &cached)) { free(src); return cached; }
-    if (vm.esp >= UC_DEPTH_MAX) rt_error("troppi import annidati");
+    if (vm.esp >= UC_DEPTH_MAX) rt_error(L("troppi import annidati", "imports nested too deeply"));
     Env *me = env_new(vm.globals);
     /* registrato prima di eseguirlo: le importazioni circolari non si ripetono */
     cell_set_key(vm.modules, key, VCELL(me->vars));
@@ -2251,7 +2353,7 @@ static void json_nl(Buf *b, int indent, int level) {
 /* Una cella senza chiavi diventa un array; altrimenti un oggetto
    (gli elementi in ordine prendono come chiave "0", "1", ...). */
 static void json_enc(Buf *b, Value v, int indent, int level) {
-    if (level > 100) rt_error("to_json: struttura troppo profonda (c'è un riferimento circolare?)");
+    if (level > 100) rt_error(L("to_json: struttura troppo profonda (c'è un riferimento circolare?)", "to_json: structure too deep (is there a circular reference?)"));
     switch (v.t) {
     case T_NIL: buf_puts(b, "null"); break;
     case T_BOOL: buf_puts(b, v.u.b ? "true" : "false"); break;
@@ -2306,7 +2408,7 @@ static void json_enc(Buf *b, Value v, int indent, int level) {
         buf_putc(b, '}');
         break;
     }
-    default: rt_error("to_json: una funzione non si può convertire in JSON");
+    default: rt_error(L("to_json: una funzione non si può convertire in JSON", "to_json: a function cannot be converted to JSON"));
     }
 }
 
@@ -2324,7 +2426,7 @@ NAT(n_to_json) {
 typedef struct { const char *s, *p, *end; } JP;
 
 NORET static void json_err(JP *j, const char *msg) {
-    rt_error("from_json: %s (al carattere %ld)", msg, (long)(j->p - j->s) + 1);
+    rt_error(L("from_json: %s (al carattere %ld)", "from_json: %s (at character %ld)"), msg, (long)(j->p - j->s) + 1);
 }
 static void jws(JP *j) { while (j->p < j->end && (*j->p == ' ' || *j->p == '\t' || *j->p == '\n' || *j->p == '\r')) j->p++; }
 static int jlit(JP *j, const char *w) {
@@ -2333,7 +2435,7 @@ static int jlit(JP *j, const char *w) {
     return 0;
 }
 static long jhex4(JP *j) {
-    if (j->end - j->p < 4) json_err(j, "sequenza \\u incompleta");
+    if (j->end - j->p < 4) json_err(j, L("sequenza \\u incompleta", "incomplete \\u sequence"));
     long v = 0;
     for (int i = 0; i < 4; i++) {
         char c = *j->p++;
@@ -2341,7 +2443,7 @@ static long jhex4(JP *j) {
         if (c >= '0' && c <= '9') v |= c - '0';
         else if (c >= 'a' && c <= 'f') v |= c - 'a' + 10;
         else if (c >= 'A' && c <= 'F') v |= c - 'A' + 10;
-        else json_err(j, "cifra esadecimale non valida");
+        else json_err(j, L("cifra esadecimale non valida", "invalid hex digit"));
     }
     return v;
 }
@@ -2349,12 +2451,12 @@ static Value jstr(JP *j) {
     Buf b = { 0 };
     j->p++;
     for (;;) {
-        if (j->p >= j->end) { free(b.s); json_err(j, "testo non terminato"); }
+        if (j->p >= j->end) { free(b.s); json_err(j, L("testo non terminato", "unterminated string")); }
         char c = *j->p++;
         if (c == '"') break;
-        if ((unsigned char)c < 0x20) { free(b.s); json_err(j, "carattere di controllo nel testo"); }
+        if ((unsigned char)c < 0x20) { free(b.s); json_err(j, L("carattere di controllo nel testo", "control character in string")); }
         if (c != '\\') { buf_putc(&b, c); continue; }
-        if (j->p >= j->end) { free(b.s); json_err(j, "escape incompleto"); }
+        if (j->p >= j->end) { free(b.s); json_err(j, L("escape incompleto", "incomplete escape")); }
         char e = *j->p++;
         switch (e) {
         case '"': case '\\': case '/': buf_putc(&b, e); break;
@@ -2374,15 +2476,15 @@ static Value jstr(JP *j) {
             buf_put(&b, u, n);
             break;
         }
-        default: free(b.s); json_err(j, "escape non valido");
+        default: free(b.s); json_err(j, L("escape non valido", "invalid escape"));
         }
     }
     return vbuf(&b);
 }
 static Value jval(JP *j, int depth) {
-    if (depth > 200) json_err(j, "struttura troppo profonda");
+    if (depth > 200) json_err(j, L("struttura troppo profonda", "structure too deep"));
     jws(j);
-    if (j->p >= j->end) json_err(j, "fine inattesa");
+    if (j->p >= j->end) json_err(j, L("fine inattesa", "unexpected end"));
     char c = *j->p;
     if (c == '"') return jstr(j);
     if (c == '[') {
@@ -2394,7 +2496,7 @@ static Value jval(JP *j, int depth) {
             jws(j);
             if (j->p < j->end && *j->p == ',') { j->p++; continue; }
             if (j->p < j->end && *j->p == ']') { j->p++; return VCELL(r); }
-            json_err(j, "attesa ',' o ']'");
+            json_err(j, L("attesa ',' o ']'", "expected ',' or ']'"));
         }
     }
     if (c == '{') {
@@ -2403,16 +2505,16 @@ static Value jval(JP *j, int depth) {
         if (j->p < j->end && *j->p == '}') { j->p++; return VCELL(r); }
         for (;;) {
             jws(j);
-            if (j->p >= j->end || *j->p != '"') json_err(j, "attesa una chiave tra virgolette");
+            if (j->p >= j->end || *j->p != '"') json_err(j, L("attesa una chiave tra virgolette", "expected a quoted key"));
             Value k = jstr(j);
             jws(j);
-            if (j->p >= j->end || *j->p != ':') json_err(j, "atteso ':'");
+            if (j->p >= j->end || *j->p != ':') json_err(j, L("atteso ':'", "expected ':'"));
             j->p++;
             cell_set_key(r, k, jval(j, depth + 1));
             jws(j);
             if (j->p < j->end && *j->p == ',') { j->p++; continue; }
             if (j->p < j->end && *j->p == '}') { j->p++; return VCELL(r); }
-            json_err(j, "attesa ',' o '}'");
+            json_err(j, L("attesa ',' o '}'", "expected ',' or '}'"));
         }
     }
     if (jlit(j, "true")) return vbool(1);
@@ -2421,11 +2523,11 @@ static Value jval(JP *j, int depth) {
     if (c == '-' || isdigit((unsigned char)c)) {
         char *e;
         double d = strtod(j->p, &e);
-        if (e == j->p) json_err(j, "numero non valido");
+        if (e == j->p) json_err(j, L("numero non valido", "invalid number"));
         j->p = e;
         return vnum(d);
     }
-    json_err(j, "valore non valido");
+    json_err(j, L("valore non valido", "invalid value"));
 }
 
 NAT(n_from_json) {
@@ -2433,7 +2535,7 @@ NAT(n_from_json) {
     JP j = { s->chars, s->chars, s->chars + s->len };
     Value v = jval(&j, 0);
     jws(&j);
-    if (j.p != j.end) json_err(&j, "testo in più dopo il valore");
+    if (j.p != j.end) json_err(&j, L("testo in più dopo il valore", "extra text after the value"));
     return v;
 }
 NAT(n_ord) {
@@ -2450,7 +2552,7 @@ NAT(n_exit) { deny("exit"); fflush(stdout); exit(argc ? (int)need_num(argc, argv
 
 static const struct { const char *en, *it; NativeFn fn; } NATIVES[] = {
     { "print", "stampa", n_print }, { "write", "scrivi", n_write }, { "input", "chiedi", n_input },
-    { "str", "testo", n_str }, { "num", "numero", n_num }, { "type", "tipo", n_type },
+    { "str", "testo", n_str }, { "num", "numero", n_num }, { "type", NULL, n_type }, { "tipo", NULL, n_tipo }, { "language", "lingua", n_lang },
     { "len", "lunghezza", n_len }, { "push", "aggiungi", n_push }, { "pop", "togli", n_pop },
     { "remove", "rimuovi", n_remove }, { "keys", "chiavi", n_keys }, { "values", "valori", n_values },
     { "has", "ha", n_has }, { "slice", "taglia", n_slice }, { "join", "unisci", n_join },
@@ -2515,7 +2617,7 @@ int uc_run(const char *src, size_t len, const char *name, Value *out) {
         vm.err = prev; vm.sp = sp; vm.esp = esp; vm.depth = depth;
         vm.unwind = U_NONE; vm.ret = VNIL; vm.fatal = 0;
         Buf b = { 0 }; to_buf(&b, vm.errval, 0, 0);
-        fprintf(stderr, "errore: %s\n%s", b.s ? b.s : "", vm.trace.s ? vm.trace.s : "");
+        fprintf(stderr, "%s: %s\n%s", L("errore", "error"), b.s ? b.s : "", vm.trace.s ? vm.trace.s : "");
         free(b.s);
         vm.errval = VNIL;
         return 0;
@@ -2526,7 +2628,23 @@ int uc_run(const char *src, size_t len, const char *name, Value *out) {
     return 1;
 }
 
+/* Lingua dei messaggi: "it" o "en". Restituisce 0 se non è disponibile. */
+int uc_lang(const char *name) {
+    int l = lang_from(name);
+    if (l < 0) return 0;
+    vm.lang = l;
+    return 1;
+}
+
 void uc_init(void) {
+    /* lingua: UNICO_LANG, altrimenti quella del sistema; inglese di base */
+    const char *env = getenv("UNICO_LANG");
+    if (lang_from(env) < 0) {
+        env = getenv("LC_ALL");
+        if (!env || !*env) env = getenv("LC_MESSAGES");
+        if (!env || !*env) env = getenv("LANG");
+    }
+    vm.lang = lang_from(env) == LANG_IT ? LANG_IT : LANG_EN;
     vm.next_gc = 50000;
     vm.rng = (uint64_t)time(NULL) * 2654435761u + 88172645463325252ULL;
     vm.globals = env_new(NULL);
@@ -2565,7 +2683,7 @@ static int open_brackets(const char *s) {
 }
 
 static void repl(void) {
-    printf("UniCo %s — un codice unico. Scrivi esci() per uscire.\n", UC_VERSION);
+    printf(L("UniCo %s — un codice unico. Scrivi esci() per uscire.\n", "UniCo %s — one code, unique. Type exit() to quit.\n"), UC_VERSION);
     Buf code = { 0 }; char line[4096];
     for (;;) {
         fputs(code.len ? "... " : "uc> ", stdout); fflush(stdout);
@@ -2584,16 +2702,28 @@ static void repl(void) {
 }
 
 static void usage(void) {
-    puts("uso: unico [opzioni] [file.uc [argomenti...]]\n"
-         "     senza file parte la modalità interattiva; '-' legge il programma dallo standard input\n"
-         "\n"
-         "  -e CODICE                esegue il codice indicato\n"
-         "  --protetto, --sandbox    niente file, importa() ed esci()\n"
-         "  --passi N, --steps N     al massimo N istruzioni eseguite\n"
-         "  --tempo S, --time S      al massimo S secondi di calcolo\n"
-         "  --memoria M, --memory M  al massimo M megabyte di memoria (circa)\n"
-         "  -v, --version            mostra la versione\n"
-         "  -h, --help               mostra questo aiuto");
+    puts(L("uso: unico [opzioni] [file.uc [argomenti...]]\n"
+           "     senza file parte la modalità interattiva; '-' legge il programma dallo standard input\n"
+           "\n"
+           "  -e CODICE                esegue il codice indicato\n"
+           "  --protetto, --sandbox    niente file, importa() ed esci()\n"
+           "  --passi N, --steps N     al massimo N istruzioni eseguite\n"
+           "  --tempo S, --time S      al massimo S secondi di calcolo\n"
+           "  --memoria M, --memory M  al massimo M megabyte di memoria (circa)\n"
+           "  --lingua L, --lang L     lingua dei messaggi: it o en\n"
+           "  -v, --version            mostra la versione\n"
+           "  -h, --help               mostra questo aiuto",
+           "usage: unico [options] [file.uc [args...]]\n"
+           "       without a file it starts interactive mode; '-' reads the program from standard input\n"
+           "\n"
+           "  -e CODE                  run CODE\n"
+           "  --sandbox, --protetto    no files, import() or exit()\n"
+           "  --steps N, --passi N     run at most N statements\n"
+           "  --time S, --tempo S      use at most S seconds of CPU time\n"
+           "  --memory M, --memoria M  use at most about M megabytes of memory\n"
+           "  --lang L, --lingua L     language of messages: en or it\n"
+           "  -v, --version            show the version\n"
+           "  -h, --help               show this help"));
 }
 
 static int opt_is(const char *a, const char *it, const char *en) { return !strcmp(a, it) || !strcmp(a, en); }
@@ -2612,8 +2742,18 @@ int main(int argc, char **argv) {
         else if (opt_is(a, "--passi", "--steps") && has_val) steps = atol(argv[++i]);
         else if (opt_is(a, "--tempo", "--time") && has_val) secs = atof(argv[++i]);
         else if (opt_is(a, "--memoria", "--memory") && has_val) mb = atof(argv[++i]);
+        else if (opt_is(a, "--lingua", "--lang") && has_val) {
+            if (!uc_lang(argv[++i])) {
+                fprintf(stderr, L("unico: lingua non disponibile '%s' (disponibili: it, en)\n",
+                                  "unico: language not available '%s' (available: en, it)\n"), argv[i]);
+                return 2;
+            }
+        }
         else if (!strcmp(a, "-e") && has_val) { code = argv[++i]; break; }
-        else if (a[0] == '-' && a[1]) { fprintf(stderr, "unico: opzione sconosciuta '%s'\n", a); usage(); return 2; }
+        else if (a[0] == '-' && a[1]) {
+            fprintf(stderr, L("unico: opzione sconosciuta '%s'\n", "unico: unknown option '%s'\n"), a);
+            usage(); return 2;
+        }
         else file = a;
     }
     if (!file && !code) i = argc;   /* modalità interattiva: niente argomenti */
@@ -2632,7 +2772,7 @@ int main(int argc, char **argv) {
         while ((k = fread(tmp, 1, sizeof tmp, stdin)) > 0) buf_put(&b, tmp, k);
         src = b.s ? b.s : calloc(1, 1); n = b.len; file = "<stdin>";
     } else src = slurp(file, &n);
-    if (!src) { fprintf(stderr, "unico: impossibile aprire '%s'\n", file); return 1; }
+    if (!src) { fprintf(stderr, L("unico: impossibile aprire '%s'\n", "unico: cannot open '%s'\n"), file); return 1; }
     int ok = uc_run(src, n, file, NULL);
     free(src);
     fflush(stdout);

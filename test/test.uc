@@ -60,6 +60,19 @@ ok(presto(1) == "positivo" and presto(-1) == "altro", "ritorna")
 fn manca(a, b) = b
 ok(manca(1) == nulla, "argomenti mancanti")
 
+# --- valori predefiniti, argomenti variabili, spread
+fn saluto(nome, parola = "ciao", fine = "!") = "{parola} {nome}{fine}"
+ok(saluto("Ada") == "ciao Ada!" and saluto("Ada", "salve") == "salve Ada!", "valori predefiniti")
+ok(saluto("Ada", nulla, "?") == "ciao Ada?", "nulla usa il predefinito")
+fn tutti_arg(primo, ...resto) = [primo, resto]
+ok(tutti_arg(1) == [1, []] and tutti_arg(1, 2, 3) == [1, [2, 3]], "...resto")
+fn somma_tutti(...xs) = somma(xs)
+ok(somma_tutti(...[1, 2], 3, ...[4]) == 10, "spread negli argomenti")
+ok([0, ...[1, 2], ...[a: 1], 3] == [0, 1, 2, 3, a: 1], "spread nelle celle")
+ok(massimo(...[3, 9, 2]) == 9, "spread con funzioni native")
+f_def = |a, b = a * 2| a + b
+ok(f_def(5) == 15 and f_def(5, 1) == 6, "predefinito che usa un parametro precedente")
+
 # --- closure e ^
 fn contatore() { n = 0; || { ^n += 1; n } }
 k = contatore()
@@ -150,6 +163,18 @@ ok(importa("modulo.uc").caricamenti == 2, "un modulo si carica una volta sola")
 ok(esegui("6 * 7") == 42, "esegui")
 ok(numero("3.5") == 3.5 and numero("x") == nulla, "numero")
 ok(tipo(1) == "numero" and tipo(stampa) == "funzione", "tipo")
+ok(type(1) == "number" and type("a") == "string" and type([]) == "cell" and type(nil) == "nil", "type")
+
+# --- lingua
+lingua_prima = lingua()
+lingua("en")
+ok(str(vero) == "true" and str(nulla) == "nil" and lingua() == "en", "stampa in inglese")
+ok(prova(|| 1 + nulla, |e| e).has("invalid operation"), "errori in inglese")
+lingua("it")
+ok(str(vero) == "vero" and str([falso]) == "[falso]", "stampa in italiano")
+ok(prova(|| 1 + nulla, |e| e).has("non valida"), "errori in italiano")
+ok(tipo(1) == "numero" and type(1) == "number", "tipo e type non dipendono dalla lingua")
+lingua(lingua_prima)
 ok(carattere(codice("é")) == "é", "carattere/codice")
 ok(volte(3, |i| i) == [0, 1, 2], "volte")
 ok(accoppia([1, 2], ["a", "b"]) == [[1, "a"], [2, "b"]], "accoppia")

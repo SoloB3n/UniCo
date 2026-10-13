@@ -2,6 +2,7 @@
 # Test della riga di comando: limiti, modalità protetta, errori.
 U=${1:-./unico}
 fail=0
+export UNICO_LANG=it   # i messaggi attesi qui sotto sono in italiano
 check() {  # descrizione, output atteso (sottostringa), comando...
     desc=$1; want=$2; shift 2
     out=$("$@" 2>&1)
@@ -18,8 +19,13 @@ check "protetto: file"        "modalità protetta"  $U --protetto -e 'read_file(
 check "protetto: importa"     "modalità protetta"  $U --sandbox -e 'import("x")'
 check "protetto: esci"        "modalità protetta"  $U --sandbox -e 'exit(0)'
 check "protetto: calcolo ok"  "42"                 $U --sandbox -e 'print(to_json([6 * 7]))'
-check "catena di chiamate"    "in f, chiamata da"  $U -e 'fn f() = 1 + nil
+check "catena di chiamate"    "in f, chiamata alla riga 2" $U -e 'fn f() = 1 + nil
 f()'
 check "graffa nel testo"      "usa \\{"            $U -e 'print("{")'
 check "stdin e argomenti"     '["a", "b"]'         sh -c "echo 'print(ARGS)' | $U - a b"
+check "messaggi in inglese"   "undefined name"     $U --lang en -e 'x'
+check "inglese da ambiente"   "step limit"         env UNICO_LANG=en $U --steps 10 -e 'while true { }'
+check "inglese: stampa"       "true nil"           $U --lang en -e 'print(vero, nulla)'
+check "lingua sconosciuta"    "non disponibile"    $U --lingua xx -e '1'
+check "lingua di sistema"     "nome non definito"  env -u UNICO_LANG LANG=it_IT.UTF-8 $U -e 'x'
 if [ $fail = 0 ]; then echo "test della riga di comando superati ✓"; else exit 1; fi

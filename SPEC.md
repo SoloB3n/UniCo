@@ -2,7 +2,7 @@
 
 This file is the complete reference for writing UniCo programs. It is meant
 to be pasted into the context of an AI model that has never seen UniCo.
-Version: 0.2.0. File extension: `.uc`. Run with `unico file.uc`.
+Version: 0.3.0. File extension: `.uc`. Run with `unico file.uc`.
 
 ## 1. Lexical rules
 
@@ -119,8 +119,13 @@ h = fn(x) { x * 2 }                # anonymous fn
 return value                       # early return (also bare "return" → nil)
 ```
 
-- Missing arguments are `nil`; extra arguments are ignored. No default
-  values or varargs: use `x = x ?? default`.
+- Missing arguments are `nil`; extra arguments are ignored.
+- Default values: `fn f(a, b = 10, c = a * 2)`. A default is used when the
+  argument is missing **or nil**, and may refer to earlier parameters.
+- Rest parameter (last only): `fn log(level, ...parts)` → `parts` is a list
+  of the remaining arguments (possibly empty).
+- Spread: `f(...xs)` passes the list items of `xs` as arguments;
+  `[0, ...xs, ...dict]` copies items and keys into a new cell. `...nil` is empty.
 - Functions are closures.
 - Recursion depth limit: 1800 calls.
 
@@ -201,8 +206,8 @@ try(|| risky(), |e| handle(e))   # handler receives the raised value
 assert(cond, "message")
 ```
 
-Runtime error messages are strings like `"file.uc:12: <message>"` (Italian
-text). Uncaught errors print the call chain and exit with status 1.
+Runtime error messages are strings like `"file.uc:12: <message>"`, in the
+current language. Uncaught errors print the call chain and exit with status 1.
 
 ## 10. Built-in functions
 
@@ -211,7 +216,9 @@ English name / Italian name. `xs` = cell, `s` = string, `f` = function.
 **I/O**: `print(...)`/`stampa` (space-separated, newline) · `write(...)`/`scrivi`
 (no separator, no newline) · `input(prompt?)`/`chiedi` (nil at EOF)
 **Conversion**: `str(v)`/`testo` · `num(v)`/`numero` (nil if invalid) ·
-`type(v)`/`tipo` → `"nulla" "logico" "numero" "testo" "cella" "funzione"`
+`type(v)` → `"nil" "bool" "number" "string" "cell" "function"` ·
+`tipo(v)` → the same in Italian: `"nulla" "logico" "numero" "testo" "cella" "funzione"`.
+These never depend on the message language.
 **Cells**: `len`/`lunghezza` · `push(xs, v...)`/`aggiungi` (returns xs) ·
 `pop(xs)`/`togli` · `remove(xs, index_or_key)`/`rimuovi` · `keys`/`chiavi` ·
 `values`/`valori` · `has(xs, key)`/`ha` · `copy`/`copia`
@@ -238,6 +245,8 @@ be converted; `nil` ↔ `null`.
 **Files and code**: `read_file(path)`/`leggi_file` (nil if missing) ·
 `write_file(path, data, append?)`/`scrivi_file` · `import(path)`/`importa` ·
 `eval(code)`/`esegui` · `exit(code?)`/`esci`
+**Language**: `language()`/`lingua()` returns `"en"` or `"it"`;
+`language("it")` switches messages and printing.
 **Globals**: `ARGS`/`ARGOMENTI` (command-line arguments), `VERSIONE`.
 
 ## 11. Modules
@@ -247,10 +256,15 @@ cell with all variables it defined. Paths are resolved relative to the
 importing file first, then to the current directory. Each module runs once;
 later imports return the same cell.
 
-## 12. Printing
+## 12. Language of messages and printing
 
-`print` shows strings raw and other values as literals: `[1, "a", k: nulla]`.
-Booleans and nil print in Italian: `vero`, `falso`, `nulla`.
+UniCo speaks English and Italian. The language changes error messages and
+how `true`/`false`/`nil` print (`vero`/`falso`/`nulla` in Italian). It is
+chosen by, in order: `--lang en|it`, the `UNICO_LANG` environment variable,
+the system locale (`LANG`); the default is English. A program can fix it
+with `language("en")` at the top, so its output is the same everywhere.
+
+`print` shows strings raw and other values as literals: `[1, "a", k: nil]`.
 
 ## 13. Running untrusted code
 
@@ -263,6 +277,7 @@ unico --sandbox --steps 1000000 --time 2 --memory 64 program.uc
 - `--time S`: maximum CPU seconds. `--memory M`: approximate memory limit in MB.
 - Limit errors cannot be caught by `try`.
 - `-e CODE` runs code; `-` reads the program from standard input.
+- `--lang en|it` sets the language of messages.
 
 ## 14. Common mistakes
 
@@ -271,9 +286,12 @@ unico --sandbox --steps 1000000 --time 2 --memory 64 program.uc
 3. `if count { ... }` is always true when `count` is a number (0 is true).
 4. `"{"` → write `"\{"` or `'{'`.
 5. `match` patterns: a bare name binds, it does not compare. Use a guard.
-6. `type()` returns Italian names: compare with `"numero"`, `"testo"`, `"cella"`.
+6. `type()` returns English names (`"number"`, `"string"`, `"cell"`),
+   `tipo()` Italian ones (`"numero"`, `"testo"`, `"cella"`). Do not mix them.
 7. Using an undefined name is an error; assign it first (e.g. `x = nil`).
 8. No `++`, no `?:` ternary (use `if` as an expression), no classes, no `let`/`var`.
+9. `str(true)` is `"true"` in English and `"vero"` in Italian: call
+   `language(...)` first if a program depends on it.
 
 ## 15. Complete example
 

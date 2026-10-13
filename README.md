@@ -11,7 +11,7 @@ It is "unique" (*unico* in Italian) in every sense:
 |---|---|
 | **One data structure** | The *cell* `[ ]` is a list, a dictionary, an object and a module. |
 | **One rule** | Everything is an expression: `if`, `match`, blocks `{ }`… all return a value. |
-| **One language?** | No, two: every keyword and built-in exists in **English and Italian**, and you can mix them. |
+| **One language?** | No, two: every keyword and built-in exists in **English and Italian**, and you can mix them. Error messages and output follow your language too. |
 | **One way to call?** | No, four: `f(x)`, `x.f()`, `x \|> f`, ``a `f` b``. |
 | **One file** | Compiles anywhere there is a C compiler, and embeds into other programs. |
 | **AI-ready** | A compact [`SPEC.md`](SPEC.md) teaches the language to an AI model, and a sandbox with step, time and memory limits runs untrusted code safely. |
@@ -54,6 +54,7 @@ unico [options] [file.uc [args...]]
   --steps N, --passi N     stop after N executed statements
   --time S, --tempo S      stop after S seconds of CPU time
   --memory M, --memoria M  stop above about M megabytes of memory
+  --lang L, --lingua L     language of messages: en or it
 ```
 
 Limit errors cannot be caught by `try`, so untrusted code cannot escape them.
@@ -112,7 +113,17 @@ add3 = |a, b, c| a + b + c
 fn early(n) { if n < 0 { return "negative" }; "ok" }
 ```
 
-Missing arguments are `nil` (use `x = x ?? default` for default values).
+Missing (or nil) arguments take their **default value**, if any. A last
+parameter written `...name` collects the remaining arguments in a list, and
+`...` also **spreads** a list into a call or a cell:
+
+```uc
+fn greet(name, word = "hello") = "{word} {name}"
+fn log(level, ...parts) = "[{level}] " + join(parts, " ")
+nums = [4, 1, 9]
+max(...nums)                          # 9
+[0, ...nums, 99]                      # [0, 4, 1, 9, 99]
+```
 
 **Four ways to call the same function:**
 
@@ -193,7 +204,7 @@ fn describe(v) = match v {
   []                    => "empty list"
   [x, y]                => "pair adding up to {x + y}"
   [name: n, age: a]     => "{n} is {a} years old"
-  k if type(k) == "numero" and k < 0 => "negative"
+  k if type(k) == "number" and k < 0 => "negative"
   _                     => "something else"
 }
 ```
@@ -271,7 +282,8 @@ Every function has an English and an Italian name.
 | English | Italian | |
 |---|---|---|
 | `print`, `write`, `input` | `stampa`, `scrivi`, `chiedi` | input/output |
-| `str`, `num`, `type` | `testo`, `numero`, `tipo` | conversions |
+| `str`, `num`, `type` | `testo`, `numero`, `tipo` | conversions (`type`/`tipo` give English/Italian names) |
+| `language` | `lingua` | get or set the message language |
 | `len` | `lunghezza` | |
 | `push`, `pop`, `remove`, `copy` | `aggiungi`, `togli`, `rimuovi`, `copia` | cells |
 | `keys`, `values`, `has` | `chiavi`, `valori`, `ha` | |
@@ -293,9 +305,26 @@ Every function has an English and an Italian name.
 Command-line arguments are in `ARGS` (`ARGOMENTI`).
 The functional helpers (`map`, `filter`, …) are written in UniCo itself.
 
-Note: values print with Italian names (`vero`, `falso`, `nulla`), and `type()`
-returns Italian type names: `"numero"`, `"testo"`, `"cella"`, `"funzione"`,
-`"logico"`, `"nulla"`. Error messages are in Italian too.
+### Language of messages
+
+Error messages, the help text and the way `true`/`false`/`nil` print follow
+the user's language: English by default, Italian when the system locale is
+Italian. Override it with `--lang it`, the `UNICO_LANG` environment
+variable, or `language("it")` inside a program.
+
+```
+$ unico --lang en -e 'print(true, 1 + nil)'
+error: line 1: invalid operation '+' between number and nil
+$ unico --lang it -e 'print(true, 1 + nil)'
+errore: riga 1: operazione '+' non valida tra numero e nulla
+```
+
+`type()` always returns English names (`"number"`, `"string"`, `"cell"`…)
+and `tipo()` always Italian ones (`"numero"`, `"testo"`, `"cella"`…), so a
+program behaves the same in every language.
+
+Adding a language means adding its column to the messages: every text in
+`unico.c` is written as `L("italiano", "english")`.
 
 ---
 
@@ -312,6 +341,7 @@ static Value double_it(int argc, Value *argv) {
 int main(void) {
     uc_init();
     uc_def("double_it", double_it);
+    uc_lang("en");                        /* optional: "en" or "it" */
     uc_sandbox(1);                        /* optional: no files, import, exit */
     uc_limits(1000000, 2.0, 64 << 20);    /* optional: steps, seconds, bytes */
     const char *code = "print(double_it(21))";
