@@ -1,295 +1,298 @@
-# UniCo — un codice unico
+# UniCo — one code, unique
 
-**UniCo** è un linguaggio di programmazione piccolo, flessibile e leggerissimo.
-L'interprete completo sta in **un solo file C** (`unico.c`, circa 2200 righe),
-non dipende da niente oltre alla libreria standard e produce un eseguibile di
-circa **60 KB**.
+**UniCo** is a small, flexible and extremely lightweight programming language.
+The whole interpreter lives in **a single C file** (`unico.c`, about 2200 lines),
+depends on nothing but the C standard library, and builds into a binary of
+about **60 KB**.
 
-È "unico" in tutti i sensi:
+It is "unique" (*unico* in Italian) in every sense:
 
 | | |
 |---|---|
-| **Una sola struttura dati** | La *cella* `[ ]` fa da lista, dizionario, oggetto e modulo. |
-| **Una sola regola** | Tutto è un'espressione: `se`, `scegli`, i blocchi `{ }`… restituiscono tutti un valore. |
-| **Una sola lingua?** | No, due: ogni parola chiave esiste in italiano **e** in inglese, e si possono mescolare. |
-| **Un solo modo di chiamare?** | No, quattro: `f(x)`, `x.f()`, `x \|> f`, ``a `f` b``. |
-| **Un solo file** | Si compila ovunque ci sia un compilatore C e si incorpora in altri programmi. |
+| **One data structure** | The *cell* `[ ]` is a list, a dictionary, an object and a module. |
+| **One rule** | Everything is an expression: `if`, `match`, blocks `{ }`… all return a value. |
+| **One language?** | No, two: every keyword and built-in exists in **English and Italian**, and you can mix them. |
+| **One way to call?** | No, four: `f(x)`, `x.f()`, `x \|> f`, ``a `f` b``. |
+| **One file** | Compiles anywhere there is a C compiler, and embeds into other programs. |
 
 ```uc
-persone = [
-  [nome: "Ada",   anni: 36],
-  [nome: "Alan",  anni: 41],
-  [nome: "Grace", anni: 85],
+people = [
+  [name: "Ada",   age: 36],
+  [name: "Alan",  age: 41],
+  [name: "Grace", age: 85],
 ]
 
-persone
-  |> filtra(|p| p.anni > 40)
-  |> mappa(|p| "{p.nome} ({p.anni})")
-  |> unisci(", ")
-  |> stampa            # Alan (41), Grace (85)
+people
+  |> filter(|p| p.age > 40)
+  |> map(|p| "{p.name} ({p.age})")
+  |> join(", ")
+  |> print            # Alan (41), Grace (85)
 ```
 
 ---
 
-## Installazione
+## Getting started
 
 ```sh
-cc -O2 -o unico unico.c -lm      # oppure: make
-./unico esempi/celle.uc          # esegue un programma
-./unico                          # modalità interattiva (REPL)
-./unico -e 'stampa(6 * 7)'       # esegue una riga
-make test                        # esegue la suite di test
+cc -O2 -o unico unico.c -lm      # or: make
+./unico esempi/celle.uc          # run a program
+./unico                          # interactive mode (REPL)
+./unico -e 'print(6 * 7)'        # run a one-liner
+make test                        # run the test suite
 ```
 
-`make piccolo` produce un binario ottimizzato per dimensione.
+`make piccolo` builds a size-optimized binary.
 
 ---
 
-## Il linguaggio in 5 minuti
+## The language in 5 minutes
 
-### Valori
+### Values
 
 ```uc
-42  3.14  1_000_000  0xFF        # numeri
-"ciao {nome}"                    # testo con interpolazione: {qualsiasi espressione}
-'nessuna {interpolazione}'       # testo letterale
-vero  falso  nulla               # oppure: true false nil
-[1, 2, 3]                        # cella usata come lista
-[nome: "Ada", anni: 36]          # cella usata come dizionario/oggetto
-[1, 2, colore: "blu"]            # entrambe le cose insieme
-|x| x * 2                        # funzione (lambda)
-1..5   0..<5                     # intervalli (incluso / escluso)
+42  3.14  1_000_000  0xFF        # numbers
+"hello {name}"                   # string interpolation: {any expression}
+'no {interpolation}'             # literal string
+true  false  nil                 # or: vero falso nulla
+[1, 2, 3]                        # a cell used as a list
+[name: "Ada", age: 36]           # a cell used as a dictionary/object
+[1, 2, color: "blue"]            # both at once
+|x| x * 2                        # function (lambda)
+1..5   0..<5                     # ranges (inclusive / exclusive)
 ```
 
-Sono falsi solo `falso` e `nulla`: `0` e `""` sono veri.
+Only `false` and `nil` are falsy: `0` and `""` are truthy.
 
-### Variabili
+### Variables
 
 ```uc
-x = 10          # crea o aggiorna una variabile della funzione corrente
-x += 5          # anche -=, *=, /=
+x = 10          # creates or updates a variable of the current function
+x += 5          # also -=, *=, /=
 ```
 
-Un assegnamento crea **sempre** una variabile locale alla funzione: non si
-modifica mai per sbaglio una variabile esterna. Per modificarla davvero si
-scrive `^` davanti al nome:
+An assignment **always** creates a variable local to the current function, so
+you can never overwrite an outer variable by accident. To really modify one,
+prefix its name with `^`:
 
 ```uc
-fn contatore() {
+fn counter() {
   n = 0
-  || { ^n += 1; n }      # ^n = la "n" della funzione esterna
+  || { ^n += 1; n }      # ^n = the "n" of the enclosing function
 }
-c = contatore()
+c = counter()
 c(); c()
-stampa(c())              # 3
+print(c())               # 3
 ```
 
-### Funzioni
+### Functions
 
 ```uc
-fn quadrato(n) = n * n               # forma breve
-fn saluta(nome) {                    # forma a blocco: restituisce l'ultima espressione
-  stampa("ciao {nome}")
-  nome.maiuscolo()
+fn square(n) = n * n                 # short form
+fn greet(name) {                     # block form: returns the last expression
+  print("hello {name}")
+  name.upper()
 }
-doppio = |x| x * 2                   # lambda
-somma3 = |a, b, c| a + b + c
-fn presto(n) { se n < 0 { ritorna "negativo" }; "ok" }
+double = |x| x * 2                   # lambda
+add3 = |a, b, c| a + b + c
+fn early(n) { if n < 0 { return "negative" }; "ok" }
 ```
 
-Gli argomenti mancanti valgono `nulla`.
+Missing arguments are `nil`.
 
-**Quattro modi di chiamare la stessa funzione:**
+**Four ways to call the same function:**
 
 ```uc
-somma(mappa(lista, doppio))          # classico
-lista.mappa(doppio).somma()          # a catena: x.f(a) diventa f(x, a)
-lista |> mappa(doppio) |> somma      # a tubo:   x |> f(a) diventa f(x, a)
-3 `massimo` 7                        # infisso:  a `f` b diventa f(a, b)
+sum(map(list, double))               # classic
+list.map(double).sum()               # chained: x.f(a) becomes f(x, a)
+list |> map(double) |> sum           # piped:   x |> f(a) becomes f(x, a)
+3 `max` 7                            # infix:   a `f` b becomes f(a, b)
 ```
 
-La catena `x.f()` funziona su **qualsiasi** valore (anche testi e numeri): se `x`
-è una cella con un campo `f`, chiama quello; altrimenti cerca la funzione `f`.
-L'operatore `|>` ha la precedenza più bassa: `(a |> f) == 3`.
+Chaining with `x.f()` works on **any** value (strings and numbers too): if `x`
+is a cell with a field `f`, that is called; otherwise the function `f` is
+looked up. The `|>` operator has the lowest precedence: `(a |> f) == 3`.
 
-### Celle e oggetti
+### Cells and objects
 
 ```uc
-c = [10, 20, nome: "x"]
-c[0]  c[-1]  c.nome  c["nome"]       # lettura (indice mancante: nulla)
-c[2] = 30                            # aggiunge in coda
-c.colore = "blu"                     # aggiunge una chiave
-lunghezza(c)                         # 5
+c = [10, 20, name: "x"]
+c[0]  c[-1]  c.name  c["name"]       # read (missing index: nil)
+c[2] = 30                            # appends
+c.color = "blue"                     # adds a key
+len(c)                               # 5
 [1, 2] + [3]                         # [1, 2, 3]
 [a: 1] + [a: 2, b: 3]                # [a: 2, b: 3]
-2 in [1, 2]   "a" in [a: 1]          # vero vero
+2 in [1, 2]   "a" in [a: 1]          # true true
 ```
 
-Le celle si passano per riferimento: usa `copia(c)` se ti serve un duplicato.
+Cells are passed by reference: use `copy(c)` when you need a duplicate.
 
-Un **oggetto** è una cella che contiene funzioni. Dentro un metodo, `@` è la
-cella stessa e `@campo` è un'abbreviazione di `@.campo`:
+An **object** is a cell that contains functions. Inside a method, `@` is the
+cell itself and `@field` is shorthand for `@.field`:
 
 ```uc
-conto = [
-  saldo: 0,
-  deposita: |q| { @saldo += q; @ },    # restituire @ permette di concatenare
+account = [
+  balance: 0,
+  deposit: |q| { @balance += q; @ },   # returning @ allows chaining
 ]
-conto.deposita(50).deposita(25)
-stampa(conto.saldo)                   # 75
+account.deposit(50).deposit(25)
+print(account.balance)                 # 75
 ```
 
-Non ci sono classi: si **estende** una cella con `+`.
+There are no classes: you **extend** a cell with `+`.
 
 ```uc
-animale = [verso: "...", parla: || "{@nome} dice {@verso}"]
-cane    = animale + [nome: "Fido", verso: "bau"]
-cane.parla()                          # "Fido dice bau"
+animal = [sound: "...", speak: || "{@name} says {@sound}"]
+dog    = animal + [name: "Rex", sound: "woof"]
+dog.speak()                            # "Rex says woof"
 ```
 
-### Controllo del flusso
+### Control flow
 
 ```uc
-se x > 0 { "positivo" } altrimenti se x < 0 { "negativo" } altrimenti { "zero" }
-y = se pronto { 1 } altrimenti { 2 }        # se è un'espressione
+if x > 0 { "positive" } else if x < 0 { "negative" } else { "zero" }
+y = if ready { 1 } else { 2 }        # if is an expression
 
-mentre n > 0 { n -= 1 }
+while n > 0 { n -= 1 }
 
-per i in 1..10 { ... }               # intervallo (anche al contrario: 10..1)
-per x in lista { ... }               # valori
-per i, x in lista { ... }            # indice e valore
-per k, v in mappa { ... }            # chiave e valore
-per car in "città" { ... }           # caratteri (UTF-8)
-per i in 5 { ... }                   # 0, 1, 2, 3, 4
-per x in generatore { ... }          # chiama la funzione finché restituisce nulla
-basta      continua                  # break / continue
+for i in 1..10 { ... }               # range (also backwards: 10..1)
+for x in list { ... }                # values
+for i, x in list { ... }             # index and value
+for k, v in dict { ... }             # key and value
+for ch in "città" { ... }            # characters (UTF-8 aware)
+for i in 5 { ... }                   # 0, 1, 2, 3, 4
+for x in generator { ... }           # calls the function until it returns nil
+break      continue
 ```
 
-### `scegli`: pattern matching e destrutturazione
+### `match`: pattern matching and destructuring
 
 ```uc
-fn descrivi(v) = scegli v {
+fn describe(v) = match v {
   0                     => "zero"
-  1 | 2 | 3             => "piccolo"
-  4..9                  => "medio"
-  []                    => "lista vuota"
-  [x, y]                => "coppia con somma {x + y}"
-  [nome: n, anni: a]    => "{n} ha {a} anni"
-  k se tipo(k) == "numero" and k < 0 => "negativo"
-  _                     => "altro"
+  1 | 2 | 3             => "small"
+  4..9                  => "medium"
+  []                    => "empty list"
+  [x, y]                => "pair adding up to {x + y}"
+  [name: n, age: a]     => "{n} is {a} years old"
+  k if type(k) == "numero" and k < 0 => "negative"
+  _                     => "something else"
 }
 ```
 
-Nei pattern, `_` accetta tutto, un nome nudo cattura il valore e
-`se condizione` aggiunge una guardia.
+In patterns, `_` matches anything, a bare name captures the value, and
+`if condition` adds a guard.
 
-### Errori
+### Errors
 
 ```uc
-risultato = prova(|| {
-  se b == 0 { errore("divisione per zero") }    # errore() accetta qualsiasi valore
+result = try(|| {
+  if b == 0 { error("division by zero") }    # error() accepts any value
   a / b
-}, |e| "impossibile: {e}")
+}, |e| "impossible: {e}")
 ```
 
-### Moduli
+### Modules
 
-Ogni file è un modulo: `importa` lo esegue e restituisce le sue variabili come
-cella.
+Every file is a module: `import` runs it and returns its variables as a cell.
 
 ```uc
-geo = importa("geometria")        # carica geometria.uc
-geo.area_cerchio(2)
+geo = import("geometry")          # loads geometry.uc
+geo.circle_area(2)
 ```
 
 ---
 
-## Parole chiave
+## Keywords
 
-| Italiano | English | |
+| English | Italian | |
 |---|---|---|
-| `se` / `altrimenti` | `if` / `else` | condizione |
-| `mentre` | `while` | ciclo |
-| `per … in` | `for … in` | iterazione |
-| `scegli` | `match` | pattern matching |
-| `fn`, `funz` | `fn` | funzione |
-| `ritorna` | `return` | |
-| `basta` / `continua` | `break` / `continue` | |
-| `vero` / `falso` / `nulla` | `true` / `false` / `nil` | |
-| `non` | `not` | anche `!` |
-| | `and` / `or` | anche `&&` / `\|\|` |
+| `if` / `else` | `se` / `altrimenti` | condition |
+| `while` | `mentre` | loop |
+| `for … in` | `per … in` | iteration |
+| `match` | `scegli` | pattern matching |
+| `fn` | `fn`, `funz` | function |
+| `return` | `ritorna` | |
+| `break` / `continue` | `basta` / `continua` | |
+| `true` / `false` / `nil` | `vero` / `falso` / `nulla` | |
+| `not` | `non` | also `!` |
+| `and` / `or` | | also `&&` / `\|\|` |
 
-Operatori: `+ - * / %` · `== != < <= > >=` · `in`, `not in` · `??` (valore
-predefinito se nulla) · `..` `..<` · `|>` · `` `f` `` · `^nome` · `@` `@campo`.
-I commenti iniziano con `#` oppure `//`.
+Operators: `+ - * / %` · `== != < <= > >=` · `in`, `not in` · `??` (default
+value when nil) · `..` `..<` · `|>` · `` `f` `` · `^name` · `@` `@field`.
+Comments start with `#` or `//`.
 
-## Funzioni incluse
+## Built-in functions
 
-Ogni funzione ha un nome italiano e uno inglese.
+Every function has an English and an Italian name.
 
-| Italiano | English | |
+| English | Italian | |
 |---|---|---|
-| `stampa`, `scrivi`, `chiedi` | `print`, `write`, `input` | ingresso/uscita |
-| `testo`, `numero`, `tipo` | `str`, `num`, `type` | conversioni |
-| `lunghezza` | `len` | |
-| `aggiungi`, `togli`, `rimuovi`, `copia` | `push`, `pop`, `remove`, `copy` | celle |
-| `chiavi`, `valori`, `ha` | `keys`, `values`, `has` | |
-| `taglia`, `inverti`, `ordina`, `cerca` | `slice`, `reverse`, `sort`, `find` | celle e testi |
-| `unisci`, `dividi`, `sostituisci`, `pulisci` | `join`, `split`, `replace`, `trim` | testi |
-| `maiuscolo`, `minuscolo` | `upper`, `lower` | |
-| `carattere`, `codice` | `chr`, `ord` | |
-| `mappa`, `filtra`, `riduci`, `ognuno` | `map`, `filter`, `reduce`, `each` | funzionali |
-| `somma`, `conta`, `tutti`, `qualcuno` | `sum`, `count`, `all`, `any` | |
-| `accoppia`, `volte` | `zip`, `times` | |
-| `intero`, `arrotonda`, `assoluto`, `radice`, `potenza` | `floor`, `round`, `abs`, `sqrt`, `pow` | matematica |
-| `minimo`, `massimo`, `caso` | `min`, `max`, `random` | anche `ceil sin cos tan log exp`, `PI` |
-| `orologio`, `ora` | `clock`, `time` | tempo |
-| `errore`, `prova`, `verifica` | `error`, `try`, `assert` | errori |
-| `leggi_file`, `scrivi_file` | `read_file`, `write_file` | file |
-| `importa`, `esegui`, `esci` | `import`, `eval`, `exit` | |
+| `print`, `write`, `input` | `stampa`, `scrivi`, `chiedi` | input/output |
+| `str`, `num`, `type` | `testo`, `numero`, `tipo` | conversions |
+| `len` | `lunghezza` | |
+| `push`, `pop`, `remove`, `copy` | `aggiungi`, `togli`, `rimuovi`, `copia` | cells |
+| `keys`, `values`, `has` | `chiavi`, `valori`, `ha` | |
+| `slice`, `reverse`, `sort`, `find` | `taglia`, `inverti`, `ordina`, `cerca` | cells and strings |
+| `join`, `split`, `replace`, `trim` | `unisci`, `dividi`, `sostituisci`, `pulisci` | strings |
+| `upper`, `lower` | `maiuscolo`, `minuscolo` | |
+| `chr`, `ord` | `carattere`, `codice` | |
+| `map`, `filter`, `reduce`, `each` | `mappa`, `filtra`, `riduci`, `ognuno` | functional |
+| `sum`, `count`, `all`, `any` | `somma`, `conta`, `tutti`, `qualcuno` | |
+| `zip`, `times` | `accoppia`, `volte` | |
+| `floor`, `round`, `abs`, `sqrt`, `pow` | `intero`, `arrotonda`, `assoluto`, `radice`, `potenza` | math |
+| `min`, `max`, `random` | `minimo`, `massimo`, `caso` | also `ceil sin cos tan log exp`, `PI` |
+| `clock`, `time` | `orologio`, `ora` | time |
+| `error`, `try`, `assert` | `errore`, `prova`, `verifica` | errors |
+| `read_file`, `write_file` | `leggi_file`, `scrivi_file` | files |
+| `import`, `eval`, `exit` | `importa`, `esegui`, `esci` | |
 
-Gli argomenti da riga di comando sono in `ARGOMENTI` (`ARGS`).
-Le funzioni funzionali (`mappa`, `filtra`, …) sono scritte in UniCo stesso.
+Command-line arguments are in `ARGS` (`ARGOMENTI`).
+The functional helpers (`map`, `filter`, …) are written in UniCo itself.
+
+Note: values print with Italian names (`vero`, `falso`, `nulla`), and `type()`
+returns Italian type names: `"numero"`, `"testo"`, `"cella"`, `"funzione"`,
+`"logico"`, `"nulla"`. Error messages are in Italian too.
 
 ---
 
-## Incorporare UniCo in un programma C
+## Embedding UniCo in a C program
 
 ```c
 #define UNICO_NO_MAIN
 #include "unico.c"
 
-static Value raddoppia(int argc, Value *argv) {
+static Value double_it(int argc, Value *argv) {
     return vnum(argc ? argv[0].u.n * 2 : 0);
 }
 
 int main(void) {
     uc_init();
-    uc_def("raddoppia", raddoppia);
-    const char *codice = "stampa(raddoppia(21))";
-    uc_run(codice, strlen(codice), "incorporato", NULL);
+    uc_def("double_it", double_it);
+    const char *code = "print(double_it(21))";
+    uc_run(code, strlen(code), "embedded", NULL);
 }
 ```
 
-## Com'è fatto
+## How it works
 
-- **Lexer → parser → albero sintattico**, valutato direttamente (interprete
-  ad albero): niente bytecode, quindi codice semplice da leggere e modificare.
-- **Garbage collector mark & sweep** che gira solo tra un'istruzione e l'altra.
-  `make stress` lo esegue a *ogni* istruzione sotto AddressSanitizer per
-  verificarne la correttezza.
-- **Le variabili stanno in celle**: un modulo importato è semplicemente
-  l'ambiente in cui è stato eseguito.
-- Nomi e testi del sorgente sono condivisi in un'unica tabella, così i
-  confronti tra nomi costano poco.
+- **Lexer → parser → syntax tree**, evaluated directly (a tree-walking
+  interpreter): no bytecode, so the code is easy to read and change.
+- **Mark & sweep garbage collector** that runs only between statements.
+  `make stress` runs it on *every* statement under AddressSanitizer to check
+  that it is correct.
+- **Variables live in cells**: an imported module is simply the environment
+  it was executed in.
+- Names and strings from the source code are interned in a single table,
+  so comparing names is cheap.
 
-## Esempi
+## Examples
 
-Nella cartella [`esempi/`](esempi):
+In the [`esempi/`](esempi) folder:
 
-- `ciao.uc`: il primo programma
-- `bilingue.uc`: FizzBuzz in italiano e in inglese, con `scegli`
-- `celle.uc`: liste, dizionari, oggetti, estensione
-- `funzioni.uc`: catene, tubi, infissi, closure, generatori
-- `vita.uc`: il gioco della vita di Conway
-- `moduli.uc`: `importa` e gestione degli errori
+- `ciao.uc`: the first program
+- `bilingue.uc`: FizzBuzz in Italian and in English, with `match`
+- `celle.uc`: lists, dictionaries, objects, extension
+- `funzioni.uc`: chaining, pipes, infix calls, closures, generators
+- `vita.uc`: Conway's Game of Life
+- `moduli.uc`: `import` and error handling
