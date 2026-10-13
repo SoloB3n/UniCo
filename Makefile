@@ -9,6 +9,7 @@ piccolo: unico.c
 
 test: unico
 	./unico test/test.uc
+	sh test/cli.sh ./unico
 
 stress: unico.c
 	$(CC) -std=c99 -O1 -g -DUC_GC_STRESS -fsanitize=address,undefined -o unico-stress unico.c -lm

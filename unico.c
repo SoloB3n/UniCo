@@ -21,7 +21,7 @@
 #include <string.h>
 #include <time.h>
 
-#define UC_VERSION   "0.1.0"
+#define UC_VERSION   "0.2.0"
 #define UC_STACK_MAX 65536
 #define UC_DEPTH_MAX 1800
 
@@ -50,7 +50,8 @@ typedef struct {
     Entry *ent; int elen, ecap;
     int *idx; int icap;
 } Cell;
-typedef struct Env { Obj h; struct Env *parent; Cell *vars; } Env;
+/* loop = ambiente di una singola iterazione di "per" (vedi eval_for) */
+typedef struct Env { Obj h; struct Env *parent; Cell *vars; int loop; } Env;
 typedef struct Node Node;
 typedef struct { Obj h; Node *node; Env *env; } Func;
 typedef Value (*NativeFn)(int argc, Value *argv);
@@ -68,6 +69,8 @@ static Value vobj(VType t, void *o) { Value v; v.t = t; v.u.o = (Obj *)o; return
 #define VSTR(s)  vobj(T_STR, (s))
 #define VCELL(c) vobj(T_CELL, (c))
 
+typedef struct { char *s; size_t len, cap; } Buf;
+
 /* ================================================================== */
 /*  AST                                                                */
 /* ================================================================== */
@@ -81,6 +84,7 @@ typedef enum {
 
 struct Node {
     NType t; int line; int op; int flag; double num; Str *str;
+    const char *file;
     Node *a, *b, *c;
     Node **kids, **keys; int nk, ck;
     Str **names; int nn;
@@ -103,6 +107,16 @@ static struct {
     int line, depth;
     Str *s_self;
     uint64_t rng;
+    const char *file;                 /* file del codice in esecuzione */
+    struct { const char *name, *file; int line; } frames[UC_DEPTH_MAX + 1];
+    Buf trace;                        /* catena di chiamate dell'ultimo errore */
+    Cell *modules;                    /* moduli già importati, per percorso */
+    size_t bytes, next_bytes;         /* memoria stimata in uso */
+    /* limiti per eseguire codice non fidato */
+    int sandbox, fatal;
+    long steps, max_steps;
+    double max_time; clock_t t0;
+    size_t mem_limit;
 } vm;
 
 static Value eval(Node *n, Env *e);
@@ -121,7 +135,6 @@ static void *xrealloc(void *p, size_t n) {
     return q;
 }
 
-typedef struct { char *s; size_t len, cap; } Buf;
 static void buf_put(Buf *b, const char *s, size_t n) {
     if (b->len + n + 1 > b->cap) {
         size_t c = b->cap ? b->cap : 64;
@@ -156,8 +169,26 @@ static int u8len(unsigned char c) {
 
 static Str *str_new(const char *s, size_t n);
 
+static void buf_fmt(Buf *b, const char *fmt, ...) {
+    char tmp[512]; va_list ap;
+    va_start(ap, fmt); int n = vsnprintf(tmp, sizeof tmp, fmt, ap); va_end(ap);
+    if (n > 0) buf_put(b, tmp, n < (int)sizeof tmp ? (size_t)n : sizeof tmp - 1);
+}
+
+/* Fotografa la catena di chiamate attiva, dalla più interna. */
+static void capture_trace(void) {
+    vm.trace.len = 0;
+    if (vm.trace.s) vm.trace.s[0] = 0;
+    for (int i = vm.depth - 1, shown = 0; i >= 0; i--, shown++) {
+        if (shown == 12) { buf_fmt(&vm.trace, "  ... e altre %d chiamate\n", i + 1); break; }
+        buf_fmt(&vm.trace, "  in %s, chiamata da %s:%d\n", vm.frames[i].name,
+                vm.frames[i].file ? vm.frames[i].file : "?", vm.frames[i].line);
+    }
+}
+
 NORET static void uc_throw(Value v) {
     vm.errval = v;
+    capture_trace();
     if (vm.err) longjmp(*vm.err, 1);
     Buf b = { 0 }; to_buf(&b, v, 0, 0);
     fprintf(stderr, "errore: %s\n", b.s ? b.s : "");
@@ -167,15 +198,31 @@ NORET static void uc_throw(Value v) {
 NORET static void rt_error(const char *fmt, ...) {
     char msg[512], full[600];
     va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof msg, fmt, ap); va_end(ap);
-    snprintf(full, sizeof full, "riga %d: %s", vm.line, msg);
+    if (vm.file) snprintf(full, sizeof full, "%s:%d: %s", vm.file, vm.line, msg);
+    else snprintf(full, sizeof full, "riga %d: %s", vm.line, msg);
     uc_throw(VSTR(str_new(full, strlen(full))));
+}
+
+/* Errore dovuto a un limite: prova() non può intercettarlo. */
+NORET static void limit_error(const char *msg) {
+    vm.fatal = 1;
+    rt_error("%s", msg);
 }
 
 /* ================================================================== */
 /*  Memoria e garbage collector (mark & sweep)                         */
 /* ================================================================== */
 
+/* Ogni crescita di memoria passa di qui: con un limite attivo, oltre il
+   doppio del limite ci si ferma subito (il controllo preciso avviene nei
+   punti sicuri, dopo una raccolta). */
+static void mem_grow(size_t n) {
+    vm.bytes += n;
+    if (vm.mem_limit && vm.bytes > vm.mem_limit * 2) limit_error("superato il limite di memoria");
+}
+
 static void *gc_alloc(size_t sz, OType t) {
+    mem_grow(sz);
     Obj *o = calloc(1, sz);
     if (!o) { fputs("unico: memoria esaurita\n", stderr); exit(1); }
     o->type = t; o->next = vm.objects; vm.objects = o; vm.nobj++;
@@ -208,7 +255,21 @@ static void blacken(Obj *o) {
     }
 }
 
+static size_t obj_size(Obj *o) {
+    switch (o->type) {
+    case O_STR: return sizeof(Str) + ((Str *)o)->len + 1;
+    case O_CELL: {
+        Cell *c = (Cell *)o;
+        return sizeof(Cell) + c->acap * sizeof(Value) + c->ecap * sizeof(Entry) + c->icap * sizeof(int);
+    }
+    case O_ENV: return sizeof(Env);
+    case O_FUNC: return sizeof(Func);
+    default: return sizeof(Native);
+    }
+}
+
 static void free_obj(Obj *o) {
+    vm.bytes -= obj_size(o);
     if (o->type == O_CELL) {
         Cell *c = (Cell *)o;
         free(c->arr); free(c->ent); free(c->idx);
@@ -221,6 +282,7 @@ static void gc(void) {
     for (int i = 0; i < vm.sp; i++) mark_val(vm.stack[i]);
     for (int i = 0; i < vm.esp; i++) mark_obj((Obj *)vm.envs[i]);
     mark_val(vm.ret); mark_val(vm.errval);
+    mark_obj((Obj *)vm.modules);
     while (vm.ngray) blacken(vm.gray[--vm.ngray]);
     Obj **p = &vm.objects;
     while (*p) {
@@ -229,12 +291,28 @@ static void gc(void) {
         else { *p = o->next; free_obj(o); vm.nobj--; }
     }
     vm.next_gc = vm.nobj * 2 < 50000 ? 50000 : vm.nobj * 2;
+    vm.next_bytes = vm.bytes * 2 < (16u << 20) ? (16u << 20) : vm.bytes * 2;
+    if (vm.mem_limit && vm.next_bytes > vm.mem_limit) vm.next_bytes = vm.mem_limit;
 }
+/* Punto sicuro: tra un'istruzione e l'altra. Qui gira il garbage collector
+   e si controllano i limiti di passi, tempo e memoria. */
+static void safe_point(void) {
+    vm.steps++;
+    if (vm.max_steps && vm.steps > vm.max_steps) limit_error("superato il limite di passi");
+    if (vm.max_time > 0 && (vm.steps & 1023) == 0 &&
+        (double)(clock() - vm.t0) / CLOCKS_PER_SEC > vm.max_time)
+        limit_error("superato il limite di tempo");
 #ifdef UC_GC_STRESS
-#define MAYBE_GC() gc()
+    gc();
 #else
-#define MAYBE_GC() do { if (vm.nobj >= vm.next_gc) gc(); } while (0)
+    if (vm.nobj >= vm.next_gc || vm.bytes >= vm.next_bytes) gc();
 #endif
+    if (vm.mem_limit && vm.bytes > vm.mem_limit) {
+        gc();
+        if (vm.bytes > vm.mem_limit) limit_error("superato il limite di memoria");
+    }
+}
+#define MAYBE_GC() safe_point()
 
 /* ================================================================== */
 /*  Stringhe                                                           */
@@ -296,7 +374,9 @@ static Cell *cell_new(void) { return gc_alloc(sizeof(Cell), O_CELL); }
 
 static void cell_push(Cell *c, Value v) {
     if (c->alen == c->acap) {
-        c->acap = c->acap ? c->acap * 2 : 4;
+        int nc = c->acap ? c->acap * 2 : 4;
+        mem_grow((nc - c->acap) * sizeof(Value));
+        c->acap = nc;
         c->arr = xrealloc(c->arr, c->acap * sizeof(Value));
     }
     c->arr[c->alen++] = v;
@@ -346,6 +426,8 @@ static void cell_index_put(Cell *c, int ei) {
 static void cell_reindex(Cell *c) {
     int cap = 8;
     while (cap < c->elen * 2 + 2) cap *= 2;
+    if (cap > c->icap) mem_grow((cap - c->icap) * sizeof(int));
+    else vm.bytes -= (c->icap - cap) * sizeof(int);
     free(c->idx);
     c->idx = calloc(cap, sizeof(int)); c->icap = cap;
     for (int i = 0; i < c->elen; i++) cell_index_put(c, i);
@@ -355,7 +437,9 @@ static void cell_set_key(Cell *c, Value k, Value v) {
     int f = cell_find(c, k);
     if (f >= 0) { c->ent[f].val = v; return; }
     if (c->elen == c->ecap) {
-        c->ecap = c->ecap ? c->ecap * 2 : 4;
+        int nc = c->ecap ? c->ecap * 2 : 4;
+        mem_grow((nc - c->ecap) * sizeof(Entry));
+        c->ecap = nc;
         c->ent = xrealloc(c->ent, c->ecap * sizeof(Entry));
     }
     c->ent[c->elen].key = k; c->ent[c->elen].val = v; c->elen++;
@@ -619,11 +703,14 @@ static Value binop(int op, Value a, Value b) {
     case TK_STAR:
         if (a.t == T_NUM && b.t == T_NUM) return vnum(a.u.n * b.u.n);
         if (a.t == T_STR && b.t == T_NUM) {
+            if (vm.mem_limit && AS_STR(a)->len * b.u.n > (double)vm.mem_limit) limit_error("superato il limite di memoria");
             Buf bf = { 0 };
             for (long i = 0; i < (long)b.u.n; i++) buf_put(&bf, AS_STR(a)->chars, AS_STR(a)->len);
             return vbuf(&bf);
         }
         if (a.t == T_CELL && b.t == T_NUM) {
+            if (vm.mem_limit && AS_CELL(a)->alen * b.u.n * sizeof(Value) > (double)vm.mem_limit)
+                limit_error("superato il limite di memoria");
             Cell *c = cell_new(), *x = AS_CELL(a);
             for (long i = 0; i < (long)b.u.n; i++)
                 for (int j = 0; j < x->alen; j++) cell_push(c, x->arr[j]);
@@ -795,7 +882,10 @@ static void lex(const char *src, size_t len, int line, TokVec *tv) {
                 }
                 p++;
             }
-            if (p >= end) lex_error(L, "testo non terminato");
+            if (p >= end)
+                lex_error(L, depth > 0 ? "testo non terminato: c'è una '{' aperta "
+                                         "(per scrivere una graffa nel testo usa \\{ oppure gli apici '...')"
+                                       : "testo non terminato: manca la virgoletta di chiusura");
             Token *t = emit(tv, TK_STR, L);
             t->raw = (const char *)s; t->rawlen = (int)(p - s); t->interp = q == '"';
             p++;
@@ -870,11 +960,29 @@ NORET static void syn(P *p, const char *what) {
 }
 static Token *expect(P *p, Tk t, const char *what) { if (pt(p) != t) syn(p, what); return adv(p); }
 
+static const char *parse_file;   /* file in analisi: ogni nodo lo ricorda */
+
 static Node *nn(NType t, int line) {
     Node *n = calloc(1, sizeof(Node));
     if (!n) { fputs("unico: memoria esaurita\n", stderr); exit(1); }
-    n->t = t; n->line = line;
+    n->t = t; n->line = line; n->file = parse_file;
     return n;
+}
+
+static int has_func(Node *n) {
+    if (!n) return 0;
+    if (n->t == N_FUNC) return 1;
+    if (has_func(n->a) || has_func(n->b) || has_func(n->c)) return 1;
+    for (int i = 0; i < n->nk; i++)
+        if (has_func(n->kids[i]) || has_func(n->keys[i])) return 1;
+    return 0;
+}
+
+static void free_node(Node *n) {
+    if (!n) return;
+    free_node(n->a); free_node(n->b); free_node(n->c);
+    for (int i = 0; i < n->nk; i++) { free_node(n->kids[i]); free_node(n->keys[i]); }
+    free(n->kids); free(n->keys); free(n->names); free(n);
 }
 static void addk(Node *n, Node *k, Node *key) {
     if (n->nk == n->ck) {
@@ -921,7 +1029,10 @@ static Node *parse_string(Token *t) {
                 else if (r[j] == '}' && --depth == 0) break;
                 j++;
             }
-            if (j >= n) { vm.line = t->line; rt_error("'{' senza '}' nel testo"); }
+            if (j >= n) {
+                vm.line = t->line;
+                rt_error("'{' senza '}' nel testo (per scrivere una graffa usa \\{ oppure gli apici '...')");
+            }
             if (!parts) parts = nn(N_INTERP, t->line);
             if (lit.len) {
                 Node *s = nn(N_STR, t->line); s->str = str_intern(lit.s, lit.len);
@@ -1080,6 +1191,7 @@ static Node *parse_primary(P *p) {
         expect(p, TK_IN, "'in'");
         n->a = parse_expr(p);
         n->b = parse_block(p);
+        n->flag = has_func(n->b);   /* serve un ambiente nuovo a ogni giro */
         return n;
     case TK_MATCH: return parse_match(p, t);
     case TK_RETURN:
@@ -1273,11 +1385,25 @@ static int run_body(Node *body, Env *e) {
     return 2;
 }
 
+/* Se il corpo crea funzioni, ogni giro ha un ambiente proprio: così ogni
+   closure ricorda il valore della variabile di quel giro. Altrimenti le
+   variabili del ciclo stanno nell'ambiente della funzione (più veloce). */
 static Value eval_for(Node *n, Env *e) {
     Str *k = n->names[0], *v2 = n->nn > 1 ? n->names[1] : NULL;
-    int s;
-#define BIND(key, val) do { if (v2) { setv(e, k, (key)); setv(e, v2, (val)); } else setv(e, k, (val)); } while (0)
-#define STEP() do { s = run_body(n->b, e); if (s == 1) goto done; if (s == 2) goto done; } while (0)
+    int s, fresh = n->flag, slot = -1;
+    Env *le = e;
+#define BIND(key, val) do { \
+        if (fresh) { \
+            le = env_new(e); le->loop = 1; \
+            if (slot < 0) { \
+                if (vm.esp >= UC_DEPTH_MAX + 60) rt_error("cicli annidati troppo profondi"); \
+                slot = vm.esp++; \
+            } \
+            vm.envs[slot] = le; \
+        } \
+        if (v2) { setv(le, k, (key)); setv(le, v2, (val)); } else setv(le, k, (val)); \
+    } while (0)
+#define STEP() do { s = run_body(n->b, le); if (s) goto done; } while (0)
     int base = vm.sp;
     if (n->a->t == N_RANGE) {
         double a, b; range_eval(n->a, e, &a, &b);
@@ -1327,6 +1453,7 @@ static Value eval_for(Node *n, Env *e) {
     }
 done:
     vm.sp = base;
+    if (slot >= 0) vm.esp = slot;
     return VNIL;
 #undef BIND
 #undef STEP
@@ -1373,6 +1500,9 @@ static Value eval_assign(Node *n, Env *e) {
               op == TK_STAREQ ? TK_STAR : op == TK_SLASHEQ ? TK_SLASH : 0;
     if (t->t == N_IDENT) {
         Env *target = e;
+        Value dummy;
+        /* le variabili nuove vanno nella funzione, non nel singolo giro del ciclo */
+        while (target->loop && !cell_get_key(target->vars, VSTR(t->str), &dummy)) target = target->parent;
         if (t->flag == 1) {
             target = env_owner(e->parent, t->str);
             if (!target) rt_error("nessuna variabile esterna chiamata '%s'", t->str->chars);
@@ -1468,7 +1598,7 @@ static Value eval_match(Node *n, Env *e) {
 }
 
 static Value eval(Node *n, Env *e) {
-    vm.line = n->line;
+    vm.line = n->line; vm.file = n->file;
     switch (n->t) {
     case N_NUM: return vnum(n->num);
     case N_STR: return VSTR(n->str);
@@ -1621,28 +1751,46 @@ static Value call_value(Value f, int argc, Value *argv, Value self, int has_self
     Node *d = fn->node;
     if (vm.depth >= UC_DEPTH_MAX) rt_error("ricorsione troppo profonda");
     Env *ne = env_new(fn->env);
+    vm.frames[vm.depth].name = d->str ? d->str->chars : "<funzione anonima>";
+    vm.frames[vm.depth].file = vm.file;
+    vm.frames[vm.depth].line = vm.line;
     vm.envs[vm.esp++] = ne; vm.depth++;
     for (int i = 0; i < d->nn; i++) setv(ne, d->names[i], i < argc ? argv[i] : VNIL);
     if (has_self) setv(ne, vm.s_self, self);
-    int line = vm.line;
+    int line = vm.line; const char *file = vm.file;
     Value r = d->a->t == N_BLOCK ? eval_block(d->a, ne) : eval(d->a, ne);
     if (vm.unwind == U_RETURN) r = vm.ret;
     vm.unwind = U_NONE; vm.ret = VNIL;
-    vm.esp--; vm.depth--; vm.line = line;
+    vm.esp--; vm.depth--; vm.line = line; vm.file = file;
     return r;
 }
 
 /* Analizza ed esegue del codice in un ambiente. Gli errori risalgono. */
-static Value exec_src(const char *src, size_t len, Env *env) {
+static Value exec_src(const char *src, size_t len, Env *env, const char *file) {
+    const char *pf = parse_file, *of = vm.file;
+    int ol = vm.line;
+    parse_file = vm.file = file;
     TokVec tv = { 0 };
     lex(src, len, 1, &tv);
     P p = { tv.v, tv.n, 0 };
     Node *prog = parse_program(&p);
     free(tv.v);
+    parse_file = pf;
     Value v = eval_block(prog, env);
     if (vm.unwind == U_RETURN) v = vm.ret;
     vm.unwind = U_NONE; vm.ret = VNIL;
+    /* senza funzioni nessuno può riferirsi all'albero: lo si libera subito
+       (così esegui() in un ciclo non consuma memoria) */
+    if (!has_func(prog)) free_node(prog);
+    vm.file = of; vm.line = ol;
     return v;
+}
+
+static char *xstrdup(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *d = xrealloc(NULL, n);
+    memcpy(d, s, n);
+    return d;
 }
 
 static char *slurp(const char *path, size_t *n) {
@@ -1661,6 +1809,7 @@ static char *slurp(const char *path, size_t *n) {
 /* ================================================================== */
 
 #define NAT(name) static Value name(int argc, Value *argv)
+static void deny(const char *fn);
 #define ARG(i) ((i) < argc ? argv[i] : VNIL)
 
 static double need_num(int argc, Value *argv, int i, const char *fn) {
@@ -1979,14 +2128,16 @@ NAT(n_try) {
     Value f = ARG(0), h = ARG(1);
     jmp_buf jb; jmp_buf *prev = vm.err;
     int sp = vm.sp, esp = vm.esp, depth = vm.depth, line = vm.line;
+    const char *file = vm.file;
     vm.err = &jb;
     if (setjmp(jb) == 0) {
         Value r = call_value(f, 0, NULL, VNIL, 0);
         vm.err = prev;
         return r;
     }
-    vm.err = prev; vm.sp = sp; vm.esp = esp; vm.depth = depth; vm.line = line;
+    vm.err = prev; vm.sp = sp; vm.esp = esp; vm.depth = depth; vm.line = line; vm.file = file;
     vm.unwind = U_NONE; vm.ret = VNIL;
+    if (vm.fatal) uc_throw(vm.errval);   /* i limiti non si possono intercettare */
     Value ev = vm.errval;
     vm.errval = VNIL;
     if (h.t == T_NIL) return VNIL;
@@ -1994,12 +2145,14 @@ NAT(n_try) {
     return call_value(h, 1, a, VNIL, 0);
 }
 NAT(n_read_file) {
+    deny("read_file");
     size_t n; char *s = slurp(need_str(argc, argv, 0, "read_file")->chars, &n);
     if (!s) return VNIL;
     Value v = VSTR(str_new(s, n)); free(s);
     return v;
 }
 NAT(n_write_file) {
+    deny("write_file");
     Str *path = need_str(argc, argv, 0, "write_file");
     Value data = tostr(ARG(1));
     FILE *f = fopen(path->chars, argc > 2 && truthy(argv[2]) ? "ab" : "wb");
@@ -2008,38 +2161,280 @@ NAT(n_write_file) {
     fclose(f);
     return vbool(w == AS_STR(data)->len);
 }
+static void deny(const char *fn) {
+    if (vm.sandbox) rt_error("%s: non disponibile in modalità protetta", fn);
+}
+
+/* importa("x") cerca prima accanto al file che lo chiama, poi nella
+   cartella corrente; prova anche ad aggiungere ".uc". Ogni modulo viene
+   eseguito una volta sola: le importazioni successive riusano la cella. */
 NAT(n_import) {
+    deny("import");
     Str *path = need_str(argc, argv, 0, "import");
-    size_t n; char *src = slurp(path->chars, &n);
-    if (!src) {
-        Buf b = { 0 }; buf_put(&b, path->chars, path->len); buf_puts(&b, ".uc");
-        src = slurp(b.s, &n); free(b.s);
+    const char *bases[2] = { NULL, "" };
+    Buf dir = { 0 };
+    if (path->chars[0] != '/' && vm.file) {
+        const char *sl = strrchr(vm.file, '/');
+        if (sl) { buf_put(&dir, vm.file, sl - vm.file + 1); bases[0] = dir.s; }
     }
-    if (!src) rt_error("import: impossibile aprire '%s'", path->chars);
+    char *src = NULL; size_t n = 0; Buf full = { 0 };
+    for (int i = 0; i < 2 && !src; i++) {
+        if (!bases[i]) continue;
+        for (int ext = 0; ext < 2 && !src; ext++) {
+            full.len = 0;
+            buf_puts(&full, bases[i]); buf_put(&full, path->chars, path->len);
+            if (ext) buf_puts(&full, ".uc");
+            src = slurp(full.s, &n);
+        }
+    }
+    free(dir.s);
+    if (!src) { free(full.s); rt_error("import: impossibile trovare '%s'", path->chars); }
+    Value key = vbuf(&full), cached;
+    if (cell_get_key(vm.modules, key, &cached)) { free(src); return cached; }
     if (vm.esp >= UC_DEPTH_MAX) rt_error("troppi import annidati");
     Env *me = env_new(vm.globals);
+    /* registrato prima di eseguirlo: le importazioni circolari non si ripetono */
+    cell_set_key(vm.modules, key, VCELL(me->vars));
     vm.envs[vm.esp++] = me;
-    int line = vm.line;
-    exec_src(src, n, me);
+    exec_src(src, n, me, xstrdup(AS_STR(key)->chars));
     free(src);
-    vm.esp--; vm.line = line;
+    vm.esp--;
     return VCELL(me->vars);
 }
 NAT(n_eval) {
     Str *s = need_str(argc, argv, 0, "eval");
-    int line = vm.line;
-    Value v = exec_src(s->chars, s->len, vm.globals);
-    vm.line = line;
-    return v;
+    return exec_src(s->chars, s->len, vm.globals, "<esegui>");
+}
+static int utf8_enc(long c, char *b) {
+    if (c < 0 || c > 0x10FFFF) c = 0xFFFD;
+    if (c < 0x80) { b[0] = (char)c; return 1; }
+    if (c < 0x800) { b[0] = (char)(0xC0 | c >> 6); b[1] = (char)(0x80 | (c & 63)); return 2; }
+    if (c < 0x10000) { b[0] = (char)(0xE0 | c >> 12); b[1] = (char)(0x80 | ((c >> 6) & 63)); b[2] = (char)(0x80 | (c & 63)); return 3; }
+    b[0] = (char)(0xF0 | c >> 18); b[1] = (char)(0x80 | ((c >> 12) & 63));
+    b[2] = (char)(0x80 | ((c >> 6) & 63)); b[3] = (char)(0x80 | (c & 63));
+    return 4;
 }
 NAT(n_chr) {
-    long c = (long)need_num(argc, argv, 0, "chr");
-    char b[4]; int n;
-    if (c < 0x80) { b[0] = (char)c; n = 1; }
-    else if (c < 0x800) { b[0] = (char)(0xC0 | c >> 6); b[1] = (char)(0x80 | (c & 63)); n = 2; }
-    else if (c < 0x10000) { b[0] = (char)(0xE0 | c >> 12); b[1] = (char)(0x80 | ((c >> 6) & 63)); b[2] = (char)(0x80 | (c & 63)); n = 3; }
-    else { b[0] = (char)(0xF0 | c >> 18); b[1] = (char)(0x80 | ((c >> 12) & 63)); b[2] = (char)(0x80 | ((c >> 6) & 63)); b[3] = (char)(0x80 | (c & 63)); n = 4; }
+    char b[4];
+    int n = utf8_enc((long)need_num(argc, argv, 0, "chr"), b);
     return VSTR(str_new(b, n));
+}
+
+/* ---------- JSON ---------- */
+
+static void json_str(Buf *b, const char *s, size_t n) {
+    buf_putc(b, '"');
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+        case '"': buf_puts(b, "\\\""); break;
+        case '\\': buf_puts(b, "\\\\"); break;
+        case '\n': buf_puts(b, "\\n"); break;
+        case '\r': buf_puts(b, "\\r"); break;
+        case '\t': buf_puts(b, "\\t"); break;
+        case '\b': buf_puts(b, "\\b"); break;
+        case '\f': buf_puts(b, "\\f"); break;
+        default:
+            if (c < 0x20) buf_fmt(b, "\\u%04x", c);
+            else buf_putc(b, (char)c);
+        }
+    }
+    buf_putc(b, '"');
+}
+
+static void json_nl(Buf *b, int indent, int level) {
+    if (!indent) return;
+    buf_putc(b, '\n');
+    for (int i = 0; i < indent * level; i++) buf_putc(b, ' ');
+}
+
+/* Una cella senza chiavi diventa un array; altrimenti un oggetto
+   (gli elementi in ordine prendono come chiave "0", "1", ...). */
+static void json_enc(Buf *b, Value v, int indent, int level) {
+    if (level > 100) rt_error("to_json: struttura troppo profonda (c'è un riferimento circolare?)");
+    switch (v.t) {
+    case T_NIL: buf_puts(b, "null"); break;
+    case T_BOOL: buf_puts(b, v.u.b ? "true" : "false"); break;
+    case T_NUM: {
+        double d = v.u.n; char tmp[40];
+        if (!isfinite(d)) { buf_puts(b, "null"); break; }
+        if (d == floor(d) && fabs(d) < 1e15) snprintf(tmp, sizeof tmp, "%.0f", d == 0 ? 0.0 : d);
+        else {
+            snprintf(tmp, sizeof tmp, "%.15g", d);
+            if (strtod(tmp, NULL) != d) snprintf(tmp, sizeof tmp, "%.17g", d);
+        }
+        buf_puts(b, tmp);
+        break;
+    }
+    case T_STR: json_str(b, AS_STR(v)->chars, AS_STR(v)->len); break;
+    case T_CELL: {
+        Cell *c = AS_CELL(v);
+        int total = c->alen + c->elen, k = 0;
+        if (!c->elen) {
+            buf_putc(b, '[');
+            for (int i = 0; i < c->alen; i++) {
+                if (i) buf_putc(b, ',');
+                json_nl(b, indent, level + 1);
+                json_enc(b, c->arr[i], indent, level + 1);
+            }
+            if (c->alen) json_nl(b, indent, level);
+            buf_putc(b, ']');
+            break;
+        }
+        buf_putc(b, '{');
+        for (int i = 0; i < c->alen; i++, k++) {
+            if (k) buf_putc(b, ',');
+            json_nl(b, indent, level + 1);
+            buf_fmt(b, "\"%d\":", i);
+            if (indent) buf_putc(b, ' ');
+            json_enc(b, c->arr[i], indent, level + 1);
+        }
+        for (int i = 0; i < c->elen; i++, k++) {
+            if (k) buf_putc(b, ',');
+            json_nl(b, indent, level + 1);
+            Value key = c->ent[i].key;
+            if (key.t == T_STR) json_str(b, AS_STR(key)->chars, AS_STR(key)->len);
+            else {
+                Buf kb = { 0 }; to_buf(&kb, key, 0, 0);
+                json_str(b, kb.s, kb.len); free(kb.s);
+            }
+            buf_putc(b, ':');
+            if (indent) buf_putc(b, ' ');
+            json_enc(b, c->ent[i].val, indent, level + 1);
+        }
+        if (total) json_nl(b, indent, level);
+        buf_putc(b, '}');
+        break;
+    }
+    default: rt_error("to_json: una funzione non si può convertire in JSON");
+    }
+}
+
+NAT(n_to_json) {
+    int indent = 0;
+    if (argc > 1 && argv[1].t == T_NUM) indent = (int)argv[1].u.n;
+    else if (argc > 1 && truthy(argv[1])) indent = 2;
+    if (indent < 0) indent = 0;
+    if (indent > 16) indent = 16;
+    Buf b = { 0 };
+    json_enc(&b, ARG(0), indent, 0);
+    return vbuf(&b);
+}
+
+typedef struct { const char *s, *p, *end; } JP;
+
+NORET static void json_err(JP *j, const char *msg) {
+    rt_error("from_json: %s (al carattere %ld)", msg, (long)(j->p - j->s) + 1);
+}
+static void jws(JP *j) { while (j->p < j->end && (*j->p == ' ' || *j->p == '\t' || *j->p == '\n' || *j->p == '\r')) j->p++; }
+static int jlit(JP *j, const char *w) {
+    size_t n = strlen(w);
+    if ((size_t)(j->end - j->p) >= n && memcmp(j->p, w, n) == 0) { j->p += n; return 1; }
+    return 0;
+}
+static long jhex4(JP *j) {
+    if (j->end - j->p < 4) json_err(j, "sequenza \\u incompleta");
+    long v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = *j->p++;
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= c - '0';
+        else if (c >= 'a' && c <= 'f') v |= c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v |= c - 'A' + 10;
+        else json_err(j, "cifra esadecimale non valida");
+    }
+    return v;
+}
+static Value jstr(JP *j) {
+    Buf b = { 0 };
+    j->p++;
+    for (;;) {
+        if (j->p >= j->end) { free(b.s); json_err(j, "testo non terminato"); }
+        char c = *j->p++;
+        if (c == '"') break;
+        if ((unsigned char)c < 0x20) { free(b.s); json_err(j, "carattere di controllo nel testo"); }
+        if (c != '\\') { buf_putc(&b, c); continue; }
+        if (j->p >= j->end) { free(b.s); json_err(j, "escape incompleto"); }
+        char e = *j->p++;
+        switch (e) {
+        case '"': case '\\': case '/': buf_putc(&b, e); break;
+        case 'n': buf_putc(&b, '\n'); break;
+        case 't': buf_putc(&b, '\t'); break;
+        case 'r': buf_putc(&b, '\r'); break;
+        case 'b': buf_putc(&b, '\b'); break;
+        case 'f': buf_putc(&b, '\f'); break;
+        case 'u': {
+            long cp = jhex4(j);
+            if (cp >= 0xD800 && cp <= 0xDBFF && j->end - j->p >= 6 && j->p[0] == '\\' && j->p[1] == 'u') {
+                j->p += 2;
+                long lo = jhex4(j);
+                if (lo >= 0xDC00 && lo <= 0xDFFF) cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+            }
+            char u[4]; int n = utf8_enc(cp, u);
+            buf_put(&b, u, n);
+            break;
+        }
+        default: free(b.s); json_err(j, "escape non valido");
+        }
+    }
+    return vbuf(&b);
+}
+static Value jval(JP *j, int depth) {
+    if (depth > 200) json_err(j, "struttura troppo profonda");
+    jws(j);
+    if (j->p >= j->end) json_err(j, "fine inattesa");
+    char c = *j->p;
+    if (c == '"') return jstr(j);
+    if (c == '[') {
+        Cell *r = cell_new();
+        j->p++; jws(j);
+        if (j->p < j->end && *j->p == ']') { j->p++; return VCELL(r); }
+        for (;;) {
+            cell_push(r, jval(j, depth + 1));
+            jws(j);
+            if (j->p < j->end && *j->p == ',') { j->p++; continue; }
+            if (j->p < j->end && *j->p == ']') { j->p++; return VCELL(r); }
+            json_err(j, "attesa ',' o ']'");
+        }
+    }
+    if (c == '{') {
+        Cell *r = cell_new();
+        j->p++; jws(j);
+        if (j->p < j->end && *j->p == '}') { j->p++; return VCELL(r); }
+        for (;;) {
+            jws(j);
+            if (j->p >= j->end || *j->p != '"') json_err(j, "attesa una chiave tra virgolette");
+            Value k = jstr(j);
+            jws(j);
+            if (j->p >= j->end || *j->p != ':') json_err(j, "atteso ':'");
+            j->p++;
+            cell_set_key(r, k, jval(j, depth + 1));
+            jws(j);
+            if (j->p < j->end && *j->p == ',') { j->p++; continue; }
+            if (j->p < j->end && *j->p == '}') { j->p++; return VCELL(r); }
+            json_err(j, "attesa ',' o '}'");
+        }
+    }
+    if (jlit(j, "true")) return vbool(1);
+    if (jlit(j, "false")) return vbool(0);
+    if (jlit(j, "null")) return VNIL;
+    if (c == '-' || isdigit((unsigned char)c)) {
+        char *e;
+        double d = strtod(j->p, &e);
+        if (e == j->p) json_err(j, "numero non valido");
+        j->p = e;
+        return vnum(d);
+    }
+    json_err(j, "valore non valido");
+}
+
+NAT(n_from_json) {
+    Str *s = need_str(argc, argv, 0, "from_json");
+    JP j = { s->chars, s->chars, s->chars + s->len };
+    Value v = jval(&j, 0);
+    jws(&j);
+    if (j.p != j.end) json_err(&j, "testo in più dopo il valore");
+    return v;
 }
 NAT(n_ord) {
     Str *s = need_str(argc, argv, 0, "ord");
@@ -2051,7 +2446,7 @@ NAT(n_ord) {
     for (int i = 1; i < l; i++) c = (c << 6) | (p[i] & 63);
     return vnum(c);
 }
-NAT(n_exit) { fflush(stdout); exit(argc ? (int)need_num(argc, argv, 0, "exit") : 0); }
+NAT(n_exit) { deny("exit"); fflush(stdout); exit(argc ? (int)need_num(argc, argv, 0, "exit") : 0); }
 
 static const struct { const char *en, *it; NativeFn fn; } NATIVES[] = {
     { "print", "stampa", n_print }, { "write", "scrivi", n_write }, { "input", "chiedi", n_input },
@@ -2070,7 +2465,7 @@ static const struct { const char *en, *it; NativeFn fn; } NATIVES[] = {
     { "error", "errore", n_error }, { "try", "prova", n_try }, { "assert", "verifica", n_assert },
     { "read_file", "leggi_file", n_read_file }, { "write_file", "scrivi_file", n_write_file },
     { "import", "importa", n_import }, { "eval", "esegui", n_eval },
-    { "chr", "carattere", n_chr }, { "ord", "codice", n_ord }, { "exit", "esci", n_exit },
+    { "chr", "carattere", n_chr }, { "to_json", "in_json", n_to_json }, { "from_json", "da_json", n_from_json }, { "ord", "codice", n_ord }, { "exit", "esci", n_exit },
 };
 
 /* La libreria standard scritta in UniCo stesso. */
@@ -2100,21 +2495,32 @@ void uc_def(const char *name, NativeFn fn) {
 
 void uc_set(const char *name, Value v) { setv(vm.globals, str_intern(name, strlen(name)), v); }
 
-/* Esegue codice sorgente; stampa l'errore e restituisce 0 se fallisce. */
+/* Limiti per codice non fidato (0 = nessun limite). Valgono per ogni uc_run. */
+void uc_limits(long max_steps, double max_seconds, size_t max_bytes) {
+    vm.max_steps = max_steps; vm.max_time = max_seconds; vm.mem_limit = max_bytes;
+    if (max_bytes && vm.next_bytes > max_bytes) vm.next_bytes = max_bytes;
+}
+
+/* Modalità protetta: niente file, importazioni né esci(). */
+void uc_sandbox(int on) { vm.sandbox = on; }
+
+/* Esegue codice sorgente; stampa l'errore (con la catena di chiamate)
+   e restituisce 0 se fallisce. "name" è il nome del file, o NULL. */
 int uc_run(const char *src, size_t len, const char *name, Value *out) {
     jmp_buf jb; jmp_buf *prev = vm.err;
     int sp = vm.sp, esp = vm.esp, depth = vm.depth;
     vm.err = &jb;
+    vm.steps = 0; vm.t0 = clock(); vm.fatal = 0;
     if (setjmp(jb)) {
         vm.err = prev; vm.sp = sp; vm.esp = esp; vm.depth = depth;
-        vm.unwind = U_NONE; vm.ret = VNIL;
+        vm.unwind = U_NONE; vm.ret = VNIL; vm.fatal = 0;
         Buf b = { 0 }; to_buf(&b, vm.errval, 0, 0);
-        fprintf(stderr, "errore%s%s%s: %s\n", name ? " in " : "", name ? name : "", "", b.s ? b.s : "");
+        fprintf(stderr, "errore: %s\n%s", b.s ? b.s : "", vm.trace.s ? vm.trace.s : "");
         free(b.s);
         vm.errval = VNIL;
         return 0;
     }
-    Value v = exec_src(src, len, vm.globals);
+    Value v = exec_src(src, len, vm.globals, name ? xstrdup(name) : NULL);
     vm.err = prev;
     if (out) *out = v;
     return 1;
@@ -2125,6 +2531,7 @@ void uc_init(void) {
     vm.rng = (uint64_t)time(NULL) * 2654435761u + 88172645463325252ULL;
     vm.globals = env_new(NULL);
     vm.globals->h.perm = 1; vm.globals->vars->h.perm = 1;
+    vm.modules = cell_new(); vm.modules->h.perm = 1;
     vm.s_self = str_intern("@", 1);
     for (size_t i = 0; i < sizeof NATIVES / sizeof NATIVES[0]; i++) {
         uc_def(NATIVES[i].en, NATIVES[i].fn);
@@ -2177,27 +2584,56 @@ static void repl(void) {
 }
 
 static void usage(void) {
-    puts("uso: unico [file.uc [argomenti...]]   esegue un programma (senza file: modalità interattiva)\n"
-         "     unico -e \"codice\"                esegue il codice indicato\n"
-         "     unico -v                         mostra la versione");
+    puts("uso: unico [opzioni] [file.uc [argomenti...]]\n"
+         "     senza file parte la modalità interattiva; '-' legge il programma dallo standard input\n"
+         "\n"
+         "  -e CODICE                esegue il codice indicato\n"
+         "  --protetto, --sandbox    niente file, importa() ed esci()\n"
+         "  --passi N, --steps N     al massimo N istruzioni eseguite\n"
+         "  --tempo S, --time S      al massimo S secondi di calcolo\n"
+         "  --memoria M, --memory M  al massimo M megabyte di memoria (circa)\n"
+         "  -v, --version            mostra la versione\n"
+         "  -h, --help               mostra questo aiuto");
 }
+
+static int opt_is(const char *a, const char *it, const char *en) { return !strcmp(a, it) || !strcmp(a, en); }
 
 int main(int argc, char **argv) {
     uc_init();
+    const char *code = NULL, *file = NULL;
+    long steps = 0; double secs = 0, mb = 0;
+    int i = 1;
+    for (; i < argc && !file; i++) {
+        const char *a = argv[i];
+        int has_val = i + 1 < argc;
+        if (opt_is(a, "-v", "--version")) { printf("UniCo %s\n", UC_VERSION); return 0; }
+        else if (opt_is(a, "-h", "--help")) { usage(); return 0; }
+        else if (opt_is(a, "--protetto", "--sandbox")) uc_sandbox(1);
+        else if (opt_is(a, "--passi", "--steps") && has_val) steps = atol(argv[++i]);
+        else if (opt_is(a, "--tempo", "--time") && has_val) secs = atof(argv[++i]);
+        else if (opt_is(a, "--memoria", "--memory") && has_val) mb = atof(argv[++i]);
+        else if (!strcmp(a, "-e") && has_val) { code = argv[++i]; break; }
+        else if (a[0] == '-' && a[1]) { fprintf(stderr, "unico: opzione sconosciuta '%s'\n", a); usage(); return 2; }
+        else file = a;
+    }
+    if (!file && !code) i = argc;   /* modalità interattiva: niente argomenti */
+    else if (code) i++;
     Cell *args = cell_new();
-    for (int i = 2; i < argc; i++) cell_push(args, vstr(argv[i]));
+    for (; i < argc; i++) cell_push(args, vstr(argv[i]));
     uc_set("ARGS", VCELL(args));
     uc_set("ARGOMENTI", VCELL(args));
-    if (argc < 2) { repl(); return 0; }
-    if (!strcmp(argv[1], "-v") || !strcmp(argv[1], "--version")) { printf("UniCo %s\n", UC_VERSION); return 0; }
-    if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) { usage(); return 0; }
-    if (!strcmp(argv[1], "-e")) {
-        if (argc < 3) { usage(); return 1; }
-        return uc_run(argv[2], strlen(argv[2]), NULL, NULL) ? 0 : 1;
-    }
-    size_t n; char *src = slurp(argv[1], &n);
-    if (!src) { fprintf(stderr, "unico: impossibile aprire '%s'\n", argv[1]); return 1; }
-    int ok = uc_run(src, n, argv[1], NULL);
+    uc_limits(steps, secs, (size_t)(mb * 1024 * 1024));
+    if (code) return uc_run(code, strlen(code), NULL, NULL) ? 0 : 1;
+    if (!file) { repl(); return 0; }
+    size_t n;
+    char *src;
+    if (!strcmp(file, "-")) {
+        Buf b = { 0 }; char tmp[8192]; size_t k;
+        while ((k = fread(tmp, 1, sizeof tmp, stdin)) > 0) buf_put(&b, tmp, k);
+        src = b.s ? b.s : calloc(1, 1); n = b.len; file = "<stdin>";
+    } else src = slurp(file, &n);
+    if (!src) { fprintf(stderr, "unico: impossibile aprire '%s'\n", file); return 1; }
+    int ok = uc_run(src, n, file, NULL);
     free(src);
     fflush(stdout);
     return ok ? 0 : 1;

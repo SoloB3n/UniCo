@@ -122,6 +122,30 @@ ok(prova(|| errore("x"), |e| "preso " + e) == "preso x", "prova / errore")
 ok(prova(|| 1 + nulla) == nulla, "prova senza gestore")
 ok(prova(|| errore([codice: 42]), |e| e.codice) == 42, "errore con valore")
 
+# --- closure nei cicli: ogni giro ha la sua variabile
+fs = []
+per i in 0..<3 { push(fs, || i); ultimo_i = i }
+ok(map(fs, |f| f()) == [0, 1, 2], "closure nei cicli")
+ok(ultimo_i == 2, "variabili nuove del ciclo restano nella funzione")
+fs = []
+per k, v in [a: 1, b: 2] { push(fs, || k + v) }
+ok(fs[0]() == "a1" and fs[1]() == "b2", "closure su chiave e valore")
+
+# --- JSON
+d = [nome: "Ada", anni: 36, tag: ["x", "y"], ok: vero, nota: nulla, t: "a\"b\né"]
+ok(da_json(in_json(d)) == d, "JSON andata e ritorno")
+ok(in_json([1, "a", [b: falso]]) == '[1,"a",{"b":false}]', "in_json")
+ok(da_json('{"a": [1, 2.5, -3e2], "b": "\u00e8"}') == [a: [1, 2.5, -300], b: "è"], "da_json")
+ok(in_json([]) == "[]" and in_json([1, x: 2]) == '{"0":1,"x":2}', "celle miste in JSON")
+ok(prova(|| da_json("[1,"), |e| "errore") == "errore", "JSON non valido")
+ok(lunghezza(dividi(in_json([a: 1], 2), "\n")) == 3, "JSON indentato")
+
+# --- moduli
+m = importa("modulo")
+ok(m.saluta("Uni") == "ciao Uni", "importa relativo al file")
+m.caricamenti += 1
+ok(importa("modulo.uc").caricamenti == 2, "un modulo si carica una volta sola")
+
 # --- varie
 ok(esegui("6 * 7") == 42, "esegui")
 ok(numero("3.5") == 3.5 and numero("x") == nulla, "numero")

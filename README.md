@@ -14,6 +14,7 @@ It is "unique" (*unico* in Italian) in every sense:
 | **One language?** | No, two: every keyword and built-in exists in **English and Italian**, and you can mix them. |
 | **One way to call?** | No, four: `f(x)`, `x.f()`, `x \|> f`, ``a `f` b``. |
 | **One file** | Compiles anywhere there is a C compiler, and embeds into other programs. |
+| **AI-ready** | A compact [`SPEC.md`](SPEC.md) teaches the language to an AI model, and a sandbox with step, time and memory limits runs untrusted code safely. |
 
 ```uc
 people = [
@@ -38,10 +39,24 @@ cc -O2 -o unico unico.c -lm      # or: make
 ./unico esempi/celle.uc          # run a program
 ./unico                          # interactive mode (REPL)
 ./unico -e 'print(6 * 7)'        # run a one-liner
-make test                        # run the test suite
+make test                        # run the test suites
 ```
 
 `make piccolo` builds a size-optimized binary.
+
+### Command-line options
+
+```sh
+unico [options] [file.uc [args...]]
+  -e CODE                  run CODE
+  -                        read the program from standard input
+  --sandbox, --protetto    disable files, import() and exit()
+  --steps N, --passi N     stop after N executed statements
+  --time S, --tempo S      stop after S seconds of CPU time
+  --memory M, --memoria M  stop above about M megabytes of memory
+```
+
+Limit errors cannot be caught by `try`, so untrusted code cannot escape them.
 
 ---
 
@@ -97,7 +112,7 @@ add3 = |a, b, c| a + b + c
 fn early(n) { if n < 0 { return "negative" }; "ok" }
 ```
 
-Missing arguments are `nil`.
+Missing arguments are `nil` (use `x = x ?? default` for default values).
 
 **Four ways to call the same function:**
 
@@ -165,6 +180,9 @@ for x in generator { ... }           # calls the function until it returns nil
 break      continue
 ```
 
+Every closure created inside a `for` loop remembers the value of the loop
+variable *for that iteration*.
+
 ### `match`: pattern matching and destructuring
 
 ```uc
@@ -192,6 +210,27 @@ result = try(|| {
 }, |e| "impossible: {e}")
 ```
 
+Uncaught errors show the file, the line and the chain of calls:
+
+```
+errore: lib/util.uc:4: operazione '+' non valida tra numero e nulla
+  in rompi, chiamata da main.uc:5
+  in interna, chiamata da main.uc:4
+```
+
+### JSON
+
+```uc
+data = from_json('{"name": "Ada", "langs": ["C", "UniCo"]}')
+print(data.langs[1])                  # UniCo
+print(to_json(data))                  # compact
+print(to_json(data, 2))               # indented
+```
+
+Cells without keys become JSON arrays, the others become objects. Inside
+`"..."` a `{` starts an interpolation, so write hand-made JSON between
+single quotes `'...'` (or escape the brace as `\{`).
+
 ### Modules
 
 Every file is a module: `import` runs it and returns its variables as a cell.
@@ -200,6 +239,9 @@ Every file is a module: `import` runs it and returns its variables as a cell.
 geo = import("geometry")          # loads geometry.uc
 geo.circle_area(2)
 ```
+
+Paths are resolved relative to the importing file first, then to the current
+directory. A module runs only once: later imports return the same cell.
 
 ---
 
@@ -244,6 +286,7 @@ Every function has an English and an Italian name.
 | `min`, `max`, `random` | `minimo`, `massimo`, `caso` | also `ceil sin cos tan log exp`, `PI` |
 | `clock`, `time` | `orologio`, `ora` | time |
 | `error`, `try`, `assert` | `errore`, `prova`, `verifica` | errors |
+| `to_json`, `from_json` | `in_json`, `da_json` | JSON |
 | `read_file`, `write_file` | `leggi_file`, `scrivi_file` | files |
 | `import`, `eval`, `exit` | `importa`, `esegui`, `esci` | |
 
@@ -269,22 +312,37 @@ static Value double_it(int argc, Value *argv) {
 int main(void) {
     uc_init();
     uc_def("double_it", double_it);
+    uc_sandbox(1);                        /* optional: no files, import, exit */
+    uc_limits(1000000, 2.0, 64 << 20);    /* optional: steps, seconds, bytes */
     const char *code = "print(double_it(21))";
     uc_run(code, strlen(code), "embedded", NULL);
 }
 ```
 
+## Using UniCo with AI
+
+- **Teaching it**: paste [`SPEC.md`](SPEC.md) into the model's context. It is
+  a compact, complete reference with a list of the most common mistakes.
+- **Running AI-written code**: use `--sandbox` with `--steps`, `--time` and
+  `--memory` (or `uc_sandbox` and `uc_limits` when embedding). Errors report
+  `file:line` and the call chain, so a model can fix its own code.
+- **Exchanging data**: `to_json` and `from_json` connect UniCo to anything
+  that speaks JSON.
+
 ## How it works
 
 - **Lexer → parser → syntax tree**, evaluated directly (a tree-walking
   interpreter): no bytecode, so the code is easy to read and change.
-- **Mark & sweep garbage collector** that runs only between statements.
+- **Mark & sweep garbage collector** that runs only between statements, where
+  the step, time and memory limits are also checked.
   `make stress` runs it on *every* statement under AddressSanitizer to check
   that it is correct.
 - **Variables live in cells**: an imported module is simply the environment
   it was executed in.
 - Names and strings from the source code are interned in a single table,
   so comparing names is cheap.
+- Code passed to `eval` that defines no functions is freed right after it
+  runs, so `eval` in a loop does not grow memory.
 
 ## Examples
 
