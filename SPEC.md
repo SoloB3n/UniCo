@@ -2,7 +2,7 @@
 
 This file is the complete reference for writing UniCo programs. It is meant
 to be pasted into the context of an AI model that has never seen UniCo.
-Version: 0.3.0. File extension: `.uc`. Run with `unico file.uc`.
+Version: 0.4.0. File extension: `.uc`. Run with `unico file.uc`.
 
 ## 1. Lexical rules
 
@@ -15,8 +15,10 @@ Version: 0.3.0. File extension: `.uc`. Run with `unico file.uc`.
 - Numbers: `42`, `3.14`, `1_000`, `0xFF`, `1e-3`. All numbers are doubles.
 - Strings: `"..."` with interpolation `{expr}`; `'...'` without interpolation.
   Escapes in both: `\n \t \r \0 \\ \" \' \{ \}`.
-  **A literal `{` inside `"..."` must be written `\{`.** To write JSON by hand
-  use single quotes: `'{"a": 1}'`.
+  **A literal `{` inside `"..."` must be written `\{`.** To write JSON or
+  regular expressions by hand use single quotes: `'{"a": 1}'`, `'\d{3}'`.
+- Formatted interpolation: `"{expr:spec}"` formats the value like
+  `format(expr, "spec")` (see §10): `"{price:.2}"`, `"{name:>10}"`, `"{n:05}"`.
 
 ## 2. Keywords (English and Italian are interchangeable)
 
@@ -103,6 +105,17 @@ A cell is the only data structure: an ordered list part plus a keyed part.
 ```uc
 total = 0
 fn add(n) { ^total += n }      # without ^ it would create a local "total"
+```
+
+Multiple assignment (statement level only): all values are computed first,
+then assigned, so `a, b = b, a` swaps. With a single value on the right it
+must be a cell, which is unpacked (missing items become `nil`):
+
+```uc
+a, b = 1, 2
+a, b = b, a
+lo, hi = [min(xs), max(xs)]
+c[0], obj.k = "x", "y"
 ```
 
 ## 6. Functions
@@ -229,7 +242,29 @@ comes first)
 **Strings**: `join(xs, sep?)`/`unisci` · `split(s, sep?)`/`dividi` (no sep:
 whitespace; `""`: characters) · `replace(s, a, b)`/`sostituisci` ·
 `trim`/`pulisci` · `upper`/`maiuscolo` · `lower`/`minuscolo` ·
+`starts_with(s, x)`/`inizia_con` · `ends_with(s, x)`/`finisce_con` ·
+`pad_left(v, width, fill?)`/`riempi_sinistra` · `pad_right`/`riempi_destra` ·
 `chr(n)`/`carattere` · `ord(s)`/`codice`
+**Formatting**: `format(v, spec)`/`formatta` → string. `spec` is
+`[[fill]align][0][width][,][.decimals]`: align `<` left, `>` right, `^` centre
+(numbers default to right); `0` pads numbers with zeros; `,` adds thousands
+separators. `format(3.14159, ".2")` → `"3.14"` · `format(42, "05")` → `"00042"` ·
+`format("ab", "*^6")` → `"**ab**"` · `format(1234567.5, ",.2")` → `"1,234,567.50"`.
+Width counts characters, not bytes.
+**Lists**: `insert(xs, i, v)`/`inserisci` (negative i counts from the end, like
+Python) · `unique(xs)`/`unici` · `flatten(xs, depth = 1)`/`appiattisci` ·
+`deep_copy(v)`/`copia_profonda` · `range(stop)`, `range(start, stop, step?)`/
+`intervallo` (stop excluded, like Python)
+**Regular expressions** (own engine, same everywhere): `re_match(s, re)`/`cerca_re`
+→ `[whole, group1, ...]` or nil · `re_find_all(s, re)`/`trova_tutti_re` → list
+of matched strings · `re_replace(s, re, with)`/`sostituisci_re` (`with` is a
+string where `$0`..`$9` are groups and `$$` is `$`, or a function receiving
+`[whole, group1, ...]`) · `re_split(s, re)`/`dividi_re`.
+Syntax: `. [abc] [^a-z] \d \w \s \D \W \S \b \B ^ $ * + ? {m} {m,} {m,n}`
+(add `?` for lazy), `(group)`, `(?:group)`, `a|b`, `(?i)` at the start for
+case-insensitive. `\w`, `\b` and `(?i)` also handle accented and non-Latin
+letters. Write patterns in single quotes. Very slow patterns raise an error
+instead of hanging.
 **Functional** (written in UniCo): `map(xs, f)`/`mappa` · `filter`/`filtra` ·
 `reduce(xs, f, init)`/`riduci` · `each`/`ognuno` · `sum`/`somma` ·
 `count(xs, f)`/`conta` · `all`/`tutti` · `any`/`qualcuno` · `zip`/`accoppia` ·
@@ -237,13 +272,24 @@ whitespace; `""`: characters) · `replace(s, a, b)`/`sostituisci` ·
 **Math**: `floor`/`intero` `ceil` `round`/`arrotonda` `abs`/`assoluto`
 `sqrt`/`radice` `pow`/`potenza` `sin cos tan log exp` `min`/`minimo`
 `max`/`massimo` (several args or one list) · `random()`/`caso` ([0,1)),
-`random(n)` (0..n-1), `random(a, b)` (a..b) · `PI`
+`random(n)` (0..n-1), `random(a, b)` (a..b) · `seed(n)`/`seme` (makes
+`random` repeatable) · `PI`
 **JSON**: `to_json(v, indent?)`/`in_json` · `from_json(s)`/`da_json`.
 Cells without keys become arrays, others become objects; functions cannot
 be converted; `nil` ↔ `null`.
-**Time**: `clock()`/`orologio` (CPU seconds) · `time()`/`ora` (Unix seconds)
+**Time**: `clock()`/`orologio` (CPU seconds) · `time()`/`ora` (Unix seconds,
+with fractions) · `date(t?, utc?)` → `[year, month, day, hour, minute, second,
+weekday, text]` (weekday 1 = Monday … 7 = Sunday; `text` is
+`"2026-10-13 09:05:00"`; local time unless `utc` is true) · `data(t?, utc?)`:
+the same with Italian keys `anno mese giorno ora minuto secondo
+giorno_settimana testo` · `format_date(t, pattern, utc?)`/`formatta_data`
+(strftime patterns: `"%Y-%m-%d %H:%M"`) · `sleep(seconds)`/`aspetta`
+**System**: `env(name)`/`ambiente` (nil if unset) · `eprint(...)`/`stampa_errore`
+(like print, to standard error)
 **Files and code**: `read_file(path)`/`leggi_file` (nil if missing) ·
-`write_file(path, data, append?)`/`scrivi_file` · `import(path)`/`importa` ·
+`write_file(path, data, append?)`/`scrivi_file` · `exists(path)`/`esiste` ·
+`is_dir(path)`/`è_cartella` · `list_dir(path?)`/`elenca` (sorted names, nil if
+missing) · `remove_file(path)`/`cancella_file` · `import(path)`/`importa` ·
 `eval(code)`/`esegui` · `exit(code?)`/`esci`
 **Language**: `language()`/`lingua()` returns `"en"` or `"it"`;
 `language("it")` switches messages and printing.
@@ -272,7 +318,9 @@ with `language("en")` at the top, so its output is the same everywhere.
 unico --sandbox --steps 1000000 --time 2 --memory 64 program.uc
 ```
 
-- `--sandbox` / `--protetto`: `read_file`, `write_file`, `import`, `exit` raise errors.
+- `--sandbox` / `--protetto`: everything that touches the system raises an
+  error: `read_file`, `write_file`, `exists`, `is_dir`, `list_dir`,
+  `remove_file`, `import`, `env`, `sleep`, `exit`.
 - `--steps N`: maximum number of executed statements.
 - `--time S`: maximum CPU seconds. `--memory M`: approximate memory limit in MB.
 - Limit errors cannot be caught by `try`.
@@ -284,7 +332,8 @@ unico --sandbox --steps 1000000 --time 2 --memory 64 program.uc
 1. `xs |> sum == 6` → write `(xs |> sum) == 6`.
 2. Updating an outer variable without `^` creates a local one instead.
 3. `if count { ... }` is always true when `count` is a number (0 is true).
-4. `"{"` → write `"\{"` or `'{'`.
+4. `"{"` → write `"\{"` or `'{'`. The same for regular expressions with
+   `{3}` and for hand-written JSON: use single quotes.
 5. `match` patterns: a bare name binds, it does not compare. Use a guard.
 6. `type()` returns English names (`"number"`, `"string"`, `"cell"`),
    `tipo()` Italian ones (`"numero"`, `"testo"`, `"cella"`). Do not mix them.
@@ -292,6 +341,8 @@ unico --sandbox --steps 1000000 --time 2 --memory 64 program.uc
 8. No `++`, no `?:` ternary (use `if` as an expression), no classes, no `let`/`var`.
 9. `str(true)` is `"true"` in English and `"vero"` in Italian: call
    `language(...)` first if a program depends on it.
+10. Numbers print exactly: `0.1 + 0.2` prints `0.30000000000000004`. Use
+    `format(x, ".2")` or `"{x:.2}"` to show a fixed number of decimals.
 
 ## 15. Complete example
 

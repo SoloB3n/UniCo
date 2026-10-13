@@ -1,9 +1,9 @@
 # UniCo — one code, unique
 
 **UniCo** is a small, flexible and extremely lightweight programming language.
-The whole interpreter lives in **a single C file** (`unico.c`, about 2200 lines),
+The whole interpreter lives in **a single C file** (`unico.c`, about 3800 lines),
 depends on nothing but the C standard library, and builds into a binary of
-about **60 KB**.
+about **100 KB**.
 
 It is "unique" (*unico* in Italian) in every sense:
 
@@ -50,7 +50,7 @@ make test                        # run the test suites
 unico [options] [file.uc [args...]]
   -e CODE                  run CODE
   -                        read the program from standard input
-  --sandbox, --protetto    disable files, import() and exit()
+  --sandbox, --protetto    disable files, folders, import(), env(), sleep() and exit()
   --steps N, --passi N     stop after N executed statements
   --time S, --tempo S      stop after S seconds of CPU time
   --memory M, --memoria M  stop above about M megabytes of memory
@@ -229,6 +229,50 @@ errore: lib/util.uc:4: operazione '+' non valida tra numero e nulla
   in interna, chiamata da main.uc:4
 ```
 
+### Formatting text
+
+```uc
+price = 3.14159
+print("total: {price:.2} €")          # total: 3.14 €
+print("[{"Ada":>6}] [{42:05}]")       # [   Ada] [00042]
+print(format(1234567.5, ",.2"))       # 1,234,567.50
+print(pad_left("7", 3, "0"))          # 007
+```
+
+`"{value:spec}"` and `format(value, spec)` share the same mini-language:
+`[[fill]align][0][width][,][.decimals]`.
+
+### Multiple assignment
+
+```uc
+a, b = b, a                           # swap
+lo, hi = [min(xs), max(xs)]           # unpack a cell
+```
+
+### Regular expressions
+
+UniCo has its own regular-expression engine, so patterns behave the same on
+every system. Write them between single quotes:
+
+```uc
+re_match("tel 333-1234567", '(\d{3})-(\d+)')   # ["333-1234567", "333", "1234567"]
+re_find_all("perché però così", '\w+')        # ["perché", "però", "così"]
+re_replace("2026-10-13", '(\d+)-(\d+)-(\d+)', "$3/$2/$1")   # "13/10/2026"
+re_split("a, b;c", '[,;]\s*')                 # ["a", "b", "c"]
+```
+
+Patterns that would take forever (like `(a|aa)*$` on a long text) stop
+with an error instead of freezing the program.
+
+### Dates and the system
+
+```uc
+d = date()                            # [year: 2026, month: 10, day: 13, ..., weekday: 2, text: "2026-10-13 09:05:00"]
+print(format_date(time(), "%d/%m/%Y"))
+print(env("HOME"), exists("notes.txt"), list_dir("."))
+seed(42)                              # random() becomes repeatable
+```
+
 ### JSON
 
 ```uc
@@ -295,11 +339,18 @@ Every function has an English and an Italian name.
 | `sum`, `count`, `all`, `any` | `somma`, `conta`, `tutti`, `qualcuno` | |
 | `zip`, `times` | `accoppia`, `volte` | |
 | `floor`, `round`, `abs`, `sqrt`, `pow` | `intero`, `arrotonda`, `assoluto`, `radice`, `potenza` | math |
-| `min`, `max`, `random` | `minimo`, `massimo`, `caso` | also `ceil sin cos tan log exp`, `PI` |
+| `min`, `max`, `random`, `seed` | `minimo`, `massimo`, `caso`, `seme` | also `ceil sin cos tan log exp`, `PI` |
+| `format`, `pad_left`, `pad_right` | `formatta`, `riempi_sinistra`, `riempi_destra` | formatting |
+| `starts_with`, `ends_with` | `inizia_con`, `finisce_con` | strings |
+| `insert`, `unique`, `flatten`, `deep_copy`, `range` | `inserisci`, `unici`, `appiattisci`, `copia_profonda`, `intervallo` | lists |
+| `re_match`, `re_find_all`, `re_replace`, `re_split` | `cerca_re`, `trova_tutti_re`, `sostituisci_re`, `dividi_re` | regular expressions |
+| `date`, `format_date`, `sleep` | `data`, `formatta_data`, `aspetta` | dates (`date` has English keys, `data` Italian ones) |
+| `env`, `eprint` | `ambiente`, `stampa_errore` | system |
 | `clock`, `time` | `orologio`, `ora` | time |
 | `error`, `try`, `assert` | `errore`, `prova`, `verifica` | errors |
 | `to_json`, `from_json` | `in_json`, `da_json` | JSON |
 | `read_file`, `write_file` | `leggi_file`, `scrivi_file` | files |
+| `exists`, `is_dir`, `list_dir`, `remove_file` | `esiste`, `è_cartella`, `elenca`, `cancella_file` | files and folders |
 | `import`, `eval`, `exit` | `importa`, `esegui`, `esci` | |
 
 Command-line arguments are in `ARGS` (`ARGOMENTI`).
@@ -342,7 +393,7 @@ int main(void) {
     uc_init();
     uc_def("double_it", double_it);
     uc_lang("en");                        /* optional: "en" or "it" */
-    uc_sandbox(1);                        /* optional: no files, import, exit */
+    uc_sandbox(1);                        /* optional: nothing that touches the system */
     uc_limits(1000000, 2.0, 64 << 20);    /* optional: steps, seconds, bytes */
     const char *code = "print(double_it(21))";
     uc_run(code, strlen(code), "embedded", NULL);
@@ -398,4 +449,4 @@ Programs **written in** UniCo are not covered by this license: they belong
 to their authors, who can license them however they like.
 
 For a different license (for example to embed UniCo in a closed product),
-contact the author.
+contact the author: Stefano Benedet, <stefanoben2004@gmail.com>.

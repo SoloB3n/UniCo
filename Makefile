@@ -10,12 +10,14 @@ piccolo: unico.c
 test: unico
 	./unico test/test.uc
 	./unico test/gc.uc
+	./unico test/novita.uc
 	sh test/cli.sh ./unico
 
 stress: unico.c
 	$(CC) -std=c99 -O1 -g -DUC_GC_STRESS -fsanitize=address,undefined -o unico-stress unico.c -lm
 	ASAN_OPTIONS=detect_leaks=0 ./unico-stress test/test.uc
 	ASAN_OPTIONS=detect_leaks=0 ./unico-stress test/gc.uc
+	ASAN_OPTIONS=detect_leaks=0 ./unico-stress test/novita.uc
 
 pulisci:
 	rm -f unico unico-stress

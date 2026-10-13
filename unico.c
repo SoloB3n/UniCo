@@ -1,6 +1,6 @@
 /*
  * UniCo — un codice unico.
- * Copyright (C) 2026 Stefano Benedet
+ * Copyright (C) 2026 Stefano Benedet <stefanoben2004@gmail.com>
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Questo programma è software libero: puoi ridistribuirlo e/o modificarlo
@@ -19,6 +19,9 @@
  *   #include "unico.c"
  * e usa uc_init(), uc_def(), uc_run().
  */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L   /* nanosleep, opendir, stat */
+#endif
 #include <ctype.h>
 #include <math.h>
 #include <setjmp.h>
@@ -28,8 +31,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#include <unistd.h>
+#endif
 
-#define UC_VERSION   "0.3.0"
+#define UC_VERSION   "0.4.0"
 #define UC_STACK_MAX 65536
 #define UC_DEPTH_MAX 1800
 
@@ -89,7 +99,7 @@ typedef enum {
     N_NUM, N_STR, N_INTERP, N_IDENT, N_SELF, N_TRUE, N_FALSE, N_NIL, N_CELL,
     N_BLOCK, N_UNARY, N_BINARY, N_AND, N_OR, N_COALESCE, N_ASSIGN, N_CALL,
     N_INDEX, N_FIELD, N_FUNC, N_IF, N_WHILE, N_FOR, N_RANGE, N_MATCH, N_ARM,
-    N_WILD, N_RETURN, N_BREAK, N_CONTINUE, N_SPREAD
+    N_WILD, N_RETURN, N_BREAK, N_CONTINUE, N_SPREAD, N_FMT, N_MULTI
 } NType;
 
 struct Node {
@@ -139,6 +149,7 @@ enum { LANG_IT, LANG_EN };
 #define L(it, en) (vm.lang == LANG_EN ? (en) : (it))
 
 static Value eval(Node *n, Env *e);
+static void format_value(Buf *out, Value v, const char *spec, size_t n);
 static Value eval_block(Node *b, Env *e);
 static Value call_value(Value f, int argc, Value *argv, Value self, int has_self);
 static void to_buf(void *b, Value v, int quote, int depth);
@@ -1066,8 +1077,18 @@ static Tk pt2(P *p, int k) { int j = p->i + k; return j < p->n ? p->t[j].t : TK_
 static Token *adv(P *p) { Token *t = &p->t[p->i]; if (t->t != TK_EOF) p->i++; return t; }
 static int acc(P *p, Tk t) { if (pt(p) == t) { adv(p); return 1; } return 0; }
 
+static int in_interp;   /* stiamo analizzando un {…} dentro un testo "…" */
+
 NORET static void syn(P *p, const char *what) {
     vm.line = p->t[p->i].line;
+    if (in_interp) {
+        in_interp = 0;
+        rt_error(L("errore di sintassi dentro {…} in un testo: atteso %s, trovato '%s' "
+                   "(in \"...\" la '{' apre un'interpolazione: per una graffa vera usa \\{ oppure gli apici '...')",
+                   "syntax error inside {…} in a string: expected %s, found '%s' "
+                   "(in \"...\" a '{' starts an interpolation: for a literal brace use \\{ or single quotes '...')"),
+                 what, tkname(pt(p)));
+    }
     rt_error(L("errore di sintassi: atteso %s, trovato '%s'", "syntax error: expected %s, found '%s'"), what, tkname(pt(p)));
 }
 static Token *expect(P *p, Tk t, const char *what) { if (pt(p) != t) syn(p, what); return adv(p); }
@@ -1115,6 +1136,7 @@ static Node *parse_postfix(P *p);
 static Node *parse_range(P *p);
 static Node *parse_program(P *p);
 static Node *parse_or(P *p);
+static Node *parse_pipe(P *p);
 static Node *parse_spread_or_expr(P *p);
 
 static Node *parse_string(Token *t) {
@@ -1152,14 +1174,34 @@ static Node *parse_string(Token *t) {
                 Node *s = nn(N_STR, t->line); s->str = str_intern(lit.s, lit.len);
                 addk(parts, s, NULL); lit.len = 0;
             }
+            /* "{espressione:formato}": il ':' conta solo fuori da parentesi e testi */
+            int colon = -1, d = 0;
+            for (int q = i + 1; q < j && colon < 0; q++) {
+                char ch = r[q];
+                if (ch == '"' || ch == '\'') {
+                    char qt = ch;
+                    for (q++; q < j && r[q] != qt; q++) if (r[q] == '\\') q++;
+                } else if (ch == '(' || ch == '[' || ch == '{') d++;
+                else if (ch == ')' || ch == ']' || ch == '}') d--;
+                else if (ch == ':' && d == 0) colon = q;
+            }
+            int expr_end = colon >= 0 ? colon : j;
             TokVec tv = { 0 };
-            lex(r + i + 1, j - i - 1, t->line, &tv);
+            lex(r + i + 1, expr_end - i - 1, t->line, &tv);
             P sp = { tv.v, tv.n, 0 };
+            int outer = in_interp;
+            in_interp = 1;
             while (pt(&sp) == TK_NL) adv(&sp);
             Node *e = parse_expr(&sp);
             while (pt(&sp) == TK_NL) adv(&sp);
             if (pt(&sp) != TK_EOF) syn(&sp, L("'}' a fine espressione", "'}' after the expression"));
+            in_interp = outer;
             free(tv.v);
+            if (colon >= 0) {
+                Node *f = nn(N_FMT, t->line);
+                f->a = e; f->str = str_intern(r + colon + 1, j - colon - 1);
+                e = f;
+            }
             addk(parts, e, NULL);
             i = j;
             continue;
@@ -1472,12 +1514,34 @@ static Node *parse_expr(P *p) {
     return l;
 }
 
+static int is_target(Node *n) { return n->t == N_IDENT || n->t == N_INDEX || n->t == N_FIELD; }
+
+/* Un'istruzione: un'espressione, oppure un assegnamento multiplo
+   "a, b = 1, 2" (o "a, b = cella", che la scompone). */
+static Node *parse_statement(P *p) {
+    Node *first = parse_expr(p);
+    if (pt(p) != TK_COMMA) return first;
+    Node *m = nn(N_MULTI, first->line);
+    if (!is_target(first)) syn(p, L("fine dell'istruzione", "end of statement"));
+    addk(m, first, NULL);
+    while (acc(p, TK_COMMA)) {
+        Node *t = parse_pipe(p);
+        if (!is_target(t)) syn(p, L("un nome, un indice o un campo prima di '='", "a name, an index or a field before '='"));
+        addk(m, t, NULL);
+    }
+    expect(p, TK_EQ, "'='");
+    Node *vals = nn(N_CELL, m->line);
+    do addk(vals, parse_spread_or_expr(p), NULL); while (acc(p, TK_COMMA));
+    m->a = vals;
+    return m;
+}
+
 static void parse_stmts(P *p, Node *blk, Tk end) {
     for (;;) {
         while (pt(p) == TK_NL || pt(p) == TK_SEMI) adv(p);
         if (pt(p) == end) break;
         if (pt(p) == TK_EOF) syn(p, end == TK_RC ? "'}'" : L("fine del file", "end of file"));
-        addk(blk, parse_expr(p), NULL);
+        addk(blk, parse_statement(p), NULL);
         Tk t = pt(p);
         if (t != TK_NL && t != TK_SEMI && t != end) syn(p, L("fine dell'istruzione", "end of statement"));
     }
@@ -1714,6 +1778,55 @@ static int match_pat(Node *pat, Value v, Env *e) {
     return !vm.unwind && val_eq(v, x, 0);
 }
 
+/* Assegna v a un nome, un indice o un campo (come "=" semplice). */
+static void assign_to(Node *t, Value v, Env *e) {
+    if (t->t == N_IDENT) {
+        Env *target = e;
+        Value dummy;
+        while (target->loop && !cell_get_key(target->vars, VSTR(t->str), &dummy)) target = target->parent;
+        if (t->flag == 1) {
+            target = env_owner(e->parent, t->str);
+            if (!target) rt_error(L("nessuna variabile esterna chiamata '%s'", "no outer variable named '%s'"), t->str->chars);
+        }
+        setv(target, t->str, v);
+        return;
+    }
+    int base = vm.sp;
+    Value obj = eval(t->a, e);
+    if (vm.unwind) return;
+    push(obj);
+    Value key = t->t == N_FIELD ? VSTR(t->str) : eval(t->b, e);
+    if (vm.unwind) { vm.sp = base; return; }
+    index_set(obj, key, v);
+    vm.sp = base;
+}
+
+/* a, b = 1, 2  /  a, b = cella: i valori si calcolano tutti prima di
+   assegnare, così "a, b = b, a" scambia davvero. */
+static Value eval_multi(Node *n, Env *e) {
+    Node *vals = n->a;
+    Value src;
+    if (vals->nk == 1 && vals->kids[0]->t != N_SPREAD) {
+        src = eval(vals->kids[0], e);
+        if (vm.unwind) return src;
+        if (src.t != T_CELL)
+            rt_error(L("per assegnare a più nomi servono più valori o una cella, non %s",
+                       "assigning to several names needs several values or a cell, not %s"), tname(src));
+    } else {
+        src = eval(vals, e);
+        if (vm.unwind) return src;
+    }
+    int base = vm.sp;
+    push(src);
+    Cell *c = AS_CELL(src);
+    for (int i = 0; i < n->nk && !vm.unwind; i++) {
+        vm.line = n->line;
+        assign_to(n->kids[i], i < c->alen ? c->arr[i] : VNIL, e);
+    }
+    vm.sp = base;
+    return src;
+}
+
 static Value eval_match(Node *n, Env *e) {
     Value s = eval(n->a, e);
     if (vm.unwind) return s;
@@ -1750,9 +1863,10 @@ static Value eval(Node *n, Env *e) {
             Node *k = n->kids[i];
             if (k->t == N_STR) buf_put(&b, k->str->chars, k->str->len);
             else {
-                Value v = eval(k, e);
+                Value v = eval(k->t == N_FMT ? k->a : k, e);
                 if (vm.unwind) { free(b.s); return v; }
-                to_buf(&b, v, 0, 0);
+                if (k->t == N_FMT) format_value(&b, v, k->str->chars, k->str->len);
+                else to_buf(&b, v, 0, 0);
             }
         }
         return vbuf(&b);
@@ -1819,6 +1933,7 @@ static Value eval(Node *n, Env *e) {
     case N_OR: { Value a = eval(n->a, e); if (vm.unwind || truthy(a)) return a; return eval(n->b, e); }
     case N_COALESCE: { Value a = eval(n->a, e); if (vm.unwind || a.t != T_NIL) return a; return eval(n->b, e); }
     case N_ASSIGN: return eval_assign(n, e);
+    case N_MULTI: return eval_multi(n, e);
     case N_CALL: return eval_call(n, e);
     case N_INDEX: {
         Value o = eval(n->a, e);
@@ -1929,6 +2044,7 @@ static Value exec_src(const char *src, size_t len, Env *env, const char *file) {
     const char *pf = parse_file, *of = vm.file;
     int ol = vm.line;
     parse_file = vm.file = file;
+    in_interp = 0;
     TokVec tv = { 0 };
     lex(src, len, 1, &tv);
     P p = { tv.v, tv.n, 0 };
@@ -2295,7 +2411,8 @@ NAT(n_random) {
     return vnum(a + floor(rnd() * (b - a + 1)));
 }
 NAT(n_clock) { (void)argc; (void)argv; return vnum((double)clock() / CLOCKS_PER_SEC); }
-NAT(n_time) { (void)argc; (void)argv; return vnum((double)time(NULL)); }
+static double now_seconds(void);
+NAT(n_time) { (void)argc; (void)argv; return vnum(now_seconds()); }
 NAT(n_error) { uc_throw(argc ? argv[0] : vstr("errore")); }
 NAT(n_assert) {
     if (truthy(ARG(0))) return vbool(1);
@@ -2623,6 +2740,805 @@ NAT(n_ord) {
 }
 NAT(n_exit) { deny("exit"); fflush(stdout); exit(argc ? (int)need_num(argc, argv, 0, "exit") : 0); }
 
+/* ---------- formattazione ---------- */
+
+/* Specifica di formato (la stessa per format() e per "{x:spec}"):
+     [[riempimento]allineamento][0][larghezza][,][.decimali]
+   allineamento: < sinistra, > destra, ^ centro (numeri a destra di base);
+   0 = zeri davanti ai numeri; , = separatore delle migliaia.
+   Esempi: ".2" -> 3.14   ">8" -> "    ciao"   "08.3" -> 0003.142   "*^9" */
+static void format_value(Buf *out, Value v, const char *spec, size_t n) {
+    const char *p = spec, *end = spec + n;
+    char fill = ' ', align = 0;
+    int zero = 0, width = 0, prec = -1, group = 0;
+    if (end - p >= 2 && (p[1] == '<' || p[1] == '>' || p[1] == '^')) { fill = p[0]; align = p[1]; p += 2; }
+    else if (p < end && (*p == '<' || *p == '>' || *p == '^')) align = *p++;
+    if (p < end && *p == '0') { zero = 1; p++; }
+    while (p < end && isdigit((unsigned char)*p)) { width = width * 10 + (*p++ - '0'); if (width > 1000) width = 1000; }
+    if (p < end && *p == ',') { group = 1; p++; }
+    if (p < end && *p == '.') {
+        p++; prec = 0;
+        if (p >= end || !isdigit((unsigned char)*p)) p = end + 1;
+        while (p < end && isdigit((unsigned char)*p)) { prec = prec * 10 + (*p++ - '0'); if (prec > 100) prec = 100; }
+    }
+    if (p != end) rt_error(L("formato non valido: '%.*s' (esempi: \".2\", \">8\", \"08.3\", \",.2\")",
+                             "invalid format: '%.*s' (examples: \".2\", \">8\", \"08.3\", \",.2\")"), (int)n, spec);
+    Buf body = { 0 };
+    if (v.t == T_NUM && isfinite(v.u.n) && (prec >= 0 || group)) {
+        char tmp[512];
+        if (prec >= 0) snprintf(tmp, sizeof tmp, "%.*f", prec, v.u.n);
+        else { Buf nb = { 0 }; fmt_num(&nb, v.u.n); snprintf(tmp, sizeof tmp, "%s", nb.s); free(nb.s); }
+        if (group) {
+            const char *q = tmp; Buf g = { 0 };
+            if (*q == '-') { buf_putc(&g, *q++); }
+            size_t digits = strspn(q, "0123456789");
+            for (size_t i = 0; i < digits; i++) {
+                if (i && (digits - i) % 3 == 0) buf_putc(&g, ',');
+                buf_putc(&g, q[i]);
+            }
+            buf_puts(&g, q + digits);
+            buf_puts(&body, g.s); free(g.s);
+        } else buf_puts(&body, tmp);
+    } else to_buf(&body, v, 0, 0);
+    if (!align) align = v.t == T_NUM ? '>' : '<';
+    long len = 0;
+    for (size_t i = 0; i < body.len; i += u8len((unsigned char)body.s[i])) len++;
+    long pad = width > len ? width - len : 0;
+    const char *b = body.s ? body.s : "";
+    if (zero && v.t == T_NUM && align == '>') {
+        /* zeri dopo il segno: -0042 */
+        if (*b == '-') { buf_putc(out, '-'); b++; }
+        for (long i = 0; i < pad; i++) buf_putc(out, '0');
+        buf_puts(out, b);
+    } else {
+        long left = align == '>' ? pad : align == '^' ? pad / 2 : 0;
+        for (long i = 0; i < left; i++) buf_putc(out, fill);
+        buf_puts(out, b);
+        for (long i = 0; i < pad - left; i++) buf_putc(out, fill);
+    }
+    free(body.s);
+}
+
+NAT(n_format) {
+    Str *spec = need_str(argc, argv, 1, "format");
+    Buf b = { 0 };
+    format_value(&b, ARG(0), spec->chars, spec->len);
+    return vbuf(&b);
+}
+static Value pad_str(int argc, Value *argv, char align, const char *fn) {
+    long w = (long)need_num(argc, argv, 1, fn);
+    char fill = ' ';
+    if (argc > 2) {
+        Str *f = need_str(argc, argv, 2, fn);
+        if (f->len != 1) rt_error(L("%s: il riempimento deve essere un solo carattere", "%s: the fill must be a single character"), fn);
+        fill = f->chars[0];
+    }
+    char spec[32];
+    snprintf(spec, sizeof spec, "%c%c%ld", fill, align, w < 0 ? 0 : w > 1000 ? 1000 : w);
+    Buf b = { 0 };
+    format_value(&b, tostr(ARG(0)), spec, strlen(spec));
+    return vbuf(&b);
+}
+NAT(n_pad_left) { return pad_str(argc, argv, '>', "pad_left"); }
+NAT(n_pad_right) { return pad_str(argc, argv, '<', "pad_right"); }
+
+NAT(n_starts_with) {
+    Str *s = need_str(argc, argv, 0, "starts_with"), *x = need_str(argc, argv, 1, "starts_with");
+    return vbool(x->len <= s->len && memcmp(s->chars, x->chars, x->len) == 0);
+}
+NAT(n_ends_with) {
+    Str *s = need_str(argc, argv, 0, "ends_with"), *x = need_str(argc, argv, 1, "ends_with");
+    return vbool(x->len <= s->len && memcmp(s->chars + s->len - x->len, x->chars, x->len) == 0);
+}
+
+/* ---------- liste ---------- */
+
+NAT(n_seed) {
+    double d = need_num(argc, argv, 0, "seed");
+    uint64_t b; memcpy(&b, &d, 8);
+    vm.rng = b * 0x9E3779B97F4A7C15ULL ^ 0x2545F4914F6CDD1DULL;
+    if (!vm.rng) vm.rng = 88172645463325252ULL;
+    return VNIL;
+}
+NAT(n_insert) {
+    Cell *c = need_cell(argc, argv, 0, "insert");
+    long i = (long)need_num(argc, argv, 1, "insert");
+    if (i < 0) i += c->alen;          /* come in Python: -1 = prima dell'ultimo */
+    if (i < 0) i = 0;
+    if (i > c->alen) i = c->alen;
+    cell_push(c, VNIL);
+    memmove(c->arr + i + 1, c->arr + i, (c->alen - 1 - i) * sizeof(Value));
+    c->arr[i] = ARG(2);
+    return argv[0];
+}
+NAT(n_unique) {
+    Cell *c = need_cell(argc, argv, 0, "unique"), *r = cell_new(), *seen = cell_new();
+    for (int i = 0; i < c->alen; i++) {
+        Value v = c->arr[i];
+        if (key_ok(v)) {
+            if (cell_find(seen, v) >= 0) continue;
+            cell_set_key(seen, v, vbool(1));
+        } else {
+            int dup = 0;
+            for (int j = 0; j < r->alen && !dup; j++) dup = val_eq(r->arr[j], v, 0);
+            if (dup) continue;
+        }
+        cell_push(r, v);
+    }
+    return VCELL(r);
+}
+static void flatten_into(Cell *r, Cell *c, int depth) {
+    for (int i = 0; i < c->alen; i++) {
+        Value v = c->arr[i];
+        if (v.t == T_CELL && depth > 0 && !AS_CELL(v)->elen) flatten_into(r, AS_CELL(v), depth - 1);
+        else cell_push(r, v);
+    }
+}
+NAT(n_flatten) {
+    Cell *c = need_cell(argc, argv, 0, "flatten"), *r = cell_new();
+    int depth = argc > 1 ? (int)need_num(argc, argv, 1, "flatten") : 1;
+    if (depth > 100) depth = 100;
+    flatten_into(r, c, depth);
+    return VCELL(r);
+}
+static Value deep_copy(Value v, int depth) {
+    if (v.t != T_CELL) return v;
+    if (depth > 100) rt_error(L("deep_copy: struttura troppo profonda (c'è un riferimento circolare?)",
+                                "deep_copy: structure too deep (is there a circular reference?)"));
+    Cell *s = AS_CELL(v), *c = cell_new();
+    for (int i = 0; i < s->alen; i++) cell_push(c, deep_copy(s->arr[i], depth + 1));
+    for (int i = 0; i < s->elen; i++) cell_set_key(c, s->ent[i].key, deep_copy(s->ent[i].val, depth + 1));
+    return VCELL(c);
+}
+NAT(n_deep_copy) { return deep_copy(ARG(0), 0); }
+
+/* range(fine) / range(inizio, fine) / range(inizio, fine, passo): fine esclusa */
+NAT(n_range) {
+    double a = 0, b, st = 1;
+    if (argc < 2) b = need_num(argc, argv, 0, "range");
+    else { a = need_num(argc, argv, 0, "range"); b = need_num(argc, argv, 1, "range"); }
+    if (argc > 2) st = need_num(argc, argv, 2, "range");
+    if (st == 0 || !isfinite(st)) rt_error(L("range: il passo non può essere zero", "range: the step cannot be zero"));
+    double cnt = ceil((b - a) / st);
+    if (cnt > 1e8) rt_error(L("intervallo troppo grande", "range too large"));
+    Cell *c = cell_new();
+    for (long i = 0; i < (long)cnt; i++) cell_push(c, vnum(a + i * st));
+    return VCELL(c);
+}
+
+/* ---------- data e ora ---------- */
+
+static double now_seconds(void) {
+#ifdef _WIN32
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (double)(t - 116444736000000000ULL) / 1e7;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+#endif
+}
+
+static struct tm *get_tm(int argc, Value *argv, const char *fn) {
+    time_t t = argc > 0 && argv[0].t != T_NIL ? (time_t)need_num(argc, argv, 0, fn) : time(NULL);
+    static struct tm tmv;
+    struct tm *r = argc > 1 && truthy(argv[1]) ? gmtime(&t) : localtime(&t);
+    if (!r) rt_error(L("%s: data non valida", "%s: invalid date"), fn);
+    tmv = *r;
+    return &tmv;
+}
+static Value date_cell(struct tm *tm, int it) {
+    static const char *en[] = { "year", "month", "day", "hour", "minute", "second", "weekday", "text" };
+    static const char *itn[] = { "anno", "mese", "giorno", "ora", "minuto", "secondo", "giorno_settimana", "testo" };
+    const char **k = it ? itn : en;
+    double v[7] = { tm->tm_year + 1900.0, tm->tm_mon + 1.0, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec,
+                    tm->tm_wday == 0 ? 7 : tm->tm_wday };   /* 1 = lunedì ... 7 = domenica */
+    Cell *c = cell_new();
+    for (int i = 0; i < 7; i++) cell_set_key(c, VSTR(str_intern(k[i], strlen(k[i]))), vnum(v[i]));
+    char tmp[64];
+    strftime(tmp, sizeof tmp, "%Y-%m-%d %H:%M:%S", tm);
+    cell_set_key(c, VSTR(str_intern(k[7], strlen(k[7]))), vstr(tmp));
+    return VCELL(c);
+}
+NAT(n_date) { return date_cell(get_tm(argc, argv, "date"), 0); }
+NAT(n_data) { return date_cell(get_tm(argc, argv, "data"), 1); }
+NAT(n_format_date) {
+    Str *pat = need_str(argc, argv, 1, "format_date");
+    Value a[2] = { ARG(0), ARG(2) };
+    struct tm *tm = get_tm(2, a, "format_date");
+    char tmp[512];
+    size_t n = pat->len ? strftime(tmp, sizeof tmp, pat->chars, tm) : 0;
+    return VSTR(str_new(tmp, n));
+}
+NAT(n_sleep) {
+    deny("sleep");
+    double sec = need_num(argc, argv, 0, "sleep");
+    if (sec <= 0) return VNIL;
+    fflush(stdout);
+#ifdef _WIN32
+    Sleep((DWORD)(sec * 1000));
+#else
+    struct timespec ts = { (time_t)sec, (long)((sec - floor(sec)) * 1e9) };
+    nanosleep(&ts, NULL);
+#endif
+    return VNIL;
+}
+
+/* ---------- sistema e file ---------- */
+
+NAT(n_env) {
+    deny("env");
+    const char *v = getenv(need_str(argc, argv, 0, "env")->chars);
+    return v ? vstr(v) : VNIL;
+}
+NAT(n_eprint) {
+    Buf b = { 0 };
+    for (int i = 0; i < argc; i++) { if (i) buf_putc(&b, ' '); to_buf(&b, argv[i], 0, 0); }
+    buf_putc(&b, '\n');
+    fflush(stdout);
+    fwrite(b.s, 1, b.len, stderr);
+    free(b.s);
+    return VNIL;
+}
+NAT(n_exists) {
+    deny("exists");
+    struct stat st;
+    return vbool(stat(need_str(argc, argv, 0, "exists")->chars, &st) == 0);
+}
+NAT(n_is_dir) {
+    deny("is_dir");
+    struct stat st;
+    if (stat(need_str(argc, argv, 0, "is_dir")->chars, &st) != 0) return vbool(0);
+#ifdef _WIN32
+    return vbool((st.st_mode & _S_IFDIR) != 0);
+#else
+    return vbool(S_ISDIR(st.st_mode));
+#endif
+}
+NAT(n_remove_file) {
+    deny("remove_file");
+    return vbool(remove(need_str(argc, argv, 0, "remove_file")->chars) == 0);
+}
+/* elenco dei nomi in una cartella (in ordine alfabetico), o nulla se non esiste */
+NAT(n_list_dir) {
+    deny("list_dir");
+    const char *path = argc && argv[0].t != T_NIL ? need_str(argc, argv, 0, "list_dir")->chars : ".";
+    Cell *r = cell_new();
+#ifdef _WIN32
+    Buf pat = { 0 }; buf_puts(&pat, path); buf_puts(&pat, "\\*");
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat.s, &fd);
+    free(pat.s);
+    if (h == INVALID_HANDLE_VALUE) return VNIL;
+    do {
+        if (strcmp(fd.cFileName, ".") && strcmp(fd.cFileName, "..")) cell_push(r, vstr(fd.cFileName));
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(path);
+    if (!d) return VNIL;
+    struct dirent *de;
+    while ((de = readdir(d)))
+        if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..")) cell_push(r, vstr(de->d_name));
+    closedir(d);
+#endif
+    Value prev = sort_fn; int ph = sort_has;
+    sort_has = 0;
+    Value *tmp = malloc((r->alen + 1) * sizeof(Value));
+    msort(r->arr, tmp, r->alen);
+    free(tmp);
+    sort_fn = prev; sort_has = ph;
+    return VCELL(r);
+}
+
+/* ---------- espressioni regolari ----------
+   Motore proprio (niente dipendenze, funziona anche su Windows), a ritroso
+   con una pila esplicita. Sintassi: . [abc] [^a-z] \d \w \s \D \W \S \b \B
+   ^ $ * + ? {m} {m,} {m,n} (anche "pigri" con ? dopo), gruppi (...) e
+   (?:...), alternative a|b, (?i) all'inizio per ignorare maiuscole. */
+
+enum { RN_LIT, RN_ANY, RN_CLASS, RN_BOL, RN_EOL, RN_WB, RN_NWB, RN_CAT, RN_ALT, RN_GROUP, RN_REP };
+typedef struct RNode {
+    int t, cls, cap, min, max, greedy;
+    long cp;
+    struct RNode *a, **k; int nk;
+    struct RNode *next_alloc;
+} RNode;
+typedef struct { long lo, hi; } RRange;
+typedef struct { RRange *r; int n, neg; } RClass;
+enum { I_CHAR, I_ANY, I_CLASS, I_SPLIT, I_JMP, I_SAVE, I_MATCH, I_BOL, I_EOL, I_WB, I_NWB, I_PROG };
+typedef struct { int op; long x, y; } RInst;
+typedef struct {
+    char *src; size_t srclen;
+    RInst *code; int ncode;
+    RClass *cls; int ncls;
+    int ncap, nreg, icase;
+    int busy, orphan;             /* in uso da re_replace / tolta dalla cache */
+} Regex;
+typedef struct { const unsigned char *p, *end; Regex *re; RNode *nodes; } RP;
+
+#define RE_MAX_CODE  60000
+#define RE_MAX_STEPS 20000000L
+
+static long u8dec(const unsigned char *s, const unsigned char *end, int *len) {
+    int l = u8len(s[0]);
+    if (s + l > end) l = 1;
+    long c = l == 1 ? s[0] : l == 2 ? (s[0] & 31) : l == 3 ? (s[0] & 15) : (s[0] & 7);
+    for (int i = 1; i < l; i++) c = (c << 6) | (s[i] & 63);
+    *len = l;
+    return c;
+}
+
+NORET static void re_error(const char *it, const char *en) {
+    rt_error(L("regex: %s", "regex: %s"), L(it, en));
+}
+
+static RNode *rnode(RP *rp, int t) {
+    RNode *n = calloc(1, sizeof(RNode));
+    if (!n) { fputs("unico: memoria esaurita\n", stderr); exit(1); }
+    n->t = t; n->next_alloc = rp->nodes; rp->nodes = n;
+    return n;
+}
+static void radd(RNode *n, RNode *k) { n->k = xrealloc(n->k, (n->nk + 1) * sizeof(RNode *)); n->k[n->nk++] = k; }
+
+static int rclass_new(Regex *re, int neg) {
+    re->cls = xrealloc(re->cls, (re->ncls + 1) * sizeof(RClass));
+    re->cls[re->ncls].r = NULL; re->cls[re->ncls].n = 0; re->cls[re->ncls].neg = neg;
+    return re->ncls++;
+}
+static void rclass_add(Regex *re, int ci, long lo, long hi) {
+    RClass *c = &re->cls[ci];
+    c->r = xrealloc(c->r, (c->n + 1) * sizeof(RRange));
+    c->r[c->n].lo = lo; c->r[c->n].hi = hi; c->n++;
+}
+static void rclass_named(Regex *re, int ci, char e) {
+    switch (e) {
+    case 'd': rclass_add(re, ci, '0', '9'); break;
+    case 'w': rclass_add(re, ci, -1, -1); break;   /* -1: "carattere di parola" (vedi re_in_class) */
+    case 's': rclass_add(re, ci, ' ', ' '); rclass_add(re, ci, '\t', '\r'); break;
+    }
+}
+static long resc(char e) {
+    switch (e) { case 'n': return '\n'; case 't': return '\t'; case 'r': return '\r'; case 'f': return '\f'; case 'v': return '\v'; case '0': return 0; }
+    return (unsigned char)e;
+}
+
+static RNode *re_alt(RP *rp);
+
+static RNode *re_atom(RP *rp) {
+    Regex *re = rp->re;
+    unsigned char c = *rp->p;
+    if (c == '(') {
+        rp->p++;
+        RNode *g = rnode(rp, RN_GROUP);
+        if (rp->end - rp->p >= 2 && rp->p[0] == '?' && rp->p[1] == ':') { rp->p += 2; g->cap = -1; }
+        else g->cap = re->ncap++;
+        g->a = re_alt(rp);
+        if (rp->p >= rp->end || *rp->p != ')') re_error("manca ')'", "missing ')'");
+        rp->p++;
+        return g;
+    }
+    if (c == '[') {
+        rp->p++;
+        int neg = rp->p < rp->end && *rp->p == '^';
+        if (neg) rp->p++;
+        int ci = rclass_new(re, neg), first = 1;
+        while (rp->p < rp->end && (*rp->p != ']' || first)) {
+            first = 0;
+            long lo; int l;
+            if (*rp->p == '\\' && rp->p + 1 < rp->end) {
+                char e = (char)rp->p[1]; rp->p += 2;
+                if (e == 'd' || e == 'w' || e == 's') { rclass_named(re, ci, e); continue; }
+                if (e == 'D' || e == 'W' || e == 'S') re_error("\\D \\W \\S non sono ammessi tra [ ]", "\\D \\W \\S are not allowed inside [ ]");
+                lo = resc(e);
+            } else { lo = u8dec(rp->p, rp->end, &l); rp->p += l; }
+            long hi = lo;
+            if (rp->end - rp->p >= 2 && *rp->p == '-' && rp->p[1] != ']') {
+                rp->p++;
+                if (*rp->p == '\\' && rp->p + 1 < rp->end) { hi = resc((char)rp->p[1]); rp->p += 2; }
+                else { hi = u8dec(rp->p, rp->end, &l); rp->p += l; }
+                if (hi < lo) re_error("intervallo rovesciato in [ ]", "reversed range in [ ]");
+            }
+            rclass_add(re, ci, lo, hi);
+        }
+        if (rp->p >= rp->end) re_error("manca ']'", "missing ']'");
+        rp->p++;
+        RNode *n = rnode(rp, RN_CLASS); n->cls = ci;
+        return n;
+    }
+    if (c == '.') { rp->p++; return rnode(rp, RN_ANY); }
+    if (c == '^') { rp->p++; return rnode(rp, RN_BOL); }
+    if (c == '$') { rp->p++; return rnode(rp, RN_EOL); }
+    if (c == '*' || c == '+' || c == '?') re_error("quantificatore senza niente prima", "quantifier with nothing before it");
+    if (c == '\\') {
+        if (rp->p + 1 >= rp->end) re_error("'\\' alla fine", "'\\' at the end");
+        char e = (char)rp->p[1]; rp->p += 2;
+        if (e == 'b') return rnode(rp, RN_WB);
+        if (e == 'B') return rnode(rp, RN_NWB);
+        if (strchr("dwsDWS", e)) {
+            int ci = rclass_new(re, isupper((unsigned char)e) != 0);
+            rclass_named(re, ci, (char)tolower((unsigned char)e));
+            RNode *n = rnode(rp, RN_CLASS); n->cls = ci;
+            return n;
+        }
+        RNode *n = rnode(rp, RN_LIT); n->cp = resc(e);
+        return n;
+    }
+    int l;
+    RNode *n = rnode(rp, RN_LIT);
+    n->cp = u8dec(rp->p, rp->end, &l); rp->p += l;
+    return n;
+}
+
+static int re_num(RP *rp, int *out) {
+    if (rp->p >= rp->end || !isdigit(*rp->p)) return 0;
+    int v = 0;
+    while (rp->p < rp->end && isdigit(*rp->p)) { v = v * 10 + (*rp->p++ - '0'); if (v > 1000) v = 1000; }
+    *out = v;
+    return 1;
+}
+
+static RNode *re_rep(RP *rp) {
+    RNode *a = re_atom(rp);
+    while (rp->p < rp->end) {
+        int mn, mx;
+        unsigned char c = *rp->p;
+        if (c == '*') { mn = 0; mx = -1; rp->p++; }
+        else if (c == '+') { mn = 1; mx = -1; rp->p++; }
+        else if (c == '?') { mn = 0; mx = 1; rp->p++; }
+        else if (c == '{') {
+            const unsigned char *save = rp->p++;
+            if (!re_num(rp, &mn)) { rp->p = save; break; }
+            mx = mn;
+            if (rp->p < rp->end && *rp->p == ',') { rp->p++; if (!re_num(rp, &mx)) mx = -1; }
+            if (rp->p >= rp->end || *rp->p != '}') { rp->p = save; break; }
+            rp->p++;
+            if (mx >= 0 && mx < mn) re_error("{m,n} con n minore di m", "{m,n} with n less than m");
+        } else break;
+        RNode *r = rnode(rp, RN_REP);
+        r->a = a; r->min = mn; r->max = mx; r->greedy = 1;
+        if (rp->p < rp->end && *rp->p == '?') { r->greedy = 0; rp->p++; }
+        a = r;
+    }
+    return a;
+}
+
+static RNode *re_cat(RP *rp) {
+    RNode *n = rnode(rp, RN_CAT);
+    while (rp->p < rp->end && *rp->p != '|' && *rp->p != ')') radd(n, re_rep(rp));
+    return n;
+}
+static RNode *re_alt(RP *rp) {
+    RNode *first = re_cat(rp);
+    if (rp->p >= rp->end || *rp->p != '|') return first;
+    RNode *n = rnode(rp, RN_ALT);
+    radd(n, first);
+    while (rp->p < rp->end && *rp->p == '|') { rp->p++; radd(n, re_cat(rp)); }
+    return n;
+}
+
+static int re_emit(Regex *re, int op, long x, long y) {
+    if (re->ncode >= RE_MAX_CODE) re_error("espressione troppo grande", "expression too large");
+    if (re->ncode % 256 == 0) re->code = xrealloc(re->code, (re->ncode + 256) * sizeof(RInst));
+    re->code[re->ncode].op = op; re->code[re->ncode].x = x; re->code[re->ncode].y = y;
+    return re->ncode++;
+}
+
+static void re_compile(Regex *re, RNode *n) {
+    switch (n->t) {
+    case RN_LIT: re_emit(re, I_CHAR, n->cp, 0); break;
+    case RN_ANY: re_emit(re, I_ANY, 0, 0); break;
+    case RN_CLASS: re_emit(re, I_CLASS, n->cls, 0); break;
+    case RN_BOL: re_emit(re, I_BOL, 0, 0); break;
+    case RN_EOL: re_emit(re, I_EOL, 0, 0); break;
+    case RN_WB: re_emit(re, I_WB, 0, 0); break;
+    case RN_NWB: re_emit(re, I_NWB, 0, 0); break;
+    case RN_CAT: for (int i = 0; i < n->nk; i++) re_compile(re, n->k[i]); break;
+    case RN_ALT: {
+        int *jumps = malloc(n->nk * sizeof(int));
+        for (int i = 0; i < n->nk; i++) {
+            if (i < n->nk - 1) {
+                int sp = re_emit(re, I_SPLIT, 0, 0);
+                re->code[sp].x = re->ncode;
+                re_compile(re, n->k[i]);
+                jumps[i] = re_emit(re, I_JMP, 0, 0);
+                re->code[sp].y = re->ncode;
+            } else re_compile(re, n->k[i]);
+        }
+        for (int i = 0; i < n->nk - 1; i++) re->code[jumps[i]].x = re->ncode;
+        free(jumps);
+        break;
+    }
+    case RN_GROUP:
+        if (n->cap >= 0) re_emit(re, I_SAVE, 2 * n->cap, 0);
+        re_compile(re, n->a);
+        if (n->cap >= 0) re_emit(re, I_SAVE, 2 * n->cap + 1, 0);
+        break;
+    case RN_REP: {
+        for (int i = 0; i < n->min; i++) re_compile(re, n->a);
+        if (n->max < 0) {
+            /* ciclo: un registro ricorda la posizione d'inizio di ogni giro,
+               così un giro che non consuma niente non si ripete all'infinito */
+            int reg = re->nreg++;
+            int sp = re_emit(re, I_SPLIT, 0, 0);
+            int body = re_emit(re, I_SAVE, reg, 0);
+            re_compile(re, n->a);
+            re_emit(re, I_PROG, reg, 0);
+            re_emit(re, I_JMP, sp, 0);
+            int out = re->ncode;
+            re->code[sp].x = n->greedy ? body : out;
+            re->code[sp].y = n->greedy ? out : body;
+        } else {
+            int opt = n->max - n->min, *sps = malloc((opt + 1) * sizeof(int));
+            for (int i = 0; i < opt; i++) {
+                sps[i] = re_emit(re, I_SPLIT, 0, 0);
+                int body = re->ncode;
+                re_compile(re, n->a);
+                re->code[sps[i]].x = body;
+            }
+            for (int i = 0; i < opt; i++) {
+                if (n->greedy) re->code[sps[i]].y = re->ncode;
+                else { re->code[sps[i]].y = re->code[sps[i]].x; re->code[sps[i]].x = re->ncode; }
+            }
+            free(sps);
+        }
+        break;
+    }
+    }
+}
+
+static void re_free(Regex *re) {
+    for (int i = 0; i < re->ncls; i++) free(re->cls[i].r);
+    free(re->cls); free(re->code); free(re->src); free(re);
+}
+
+/* Le ultime espressioni compilate restano pronte per le chiamate successive. */
+#define RE_CACHE 8
+static Regex *re_cache[RE_CACHE];
+
+static Regex *re_get(Str *pat) {
+    for (int i = 0; i < RE_CACHE; i++) {
+        Regex *r = re_cache[i];
+        if (r && r->srclen == pat->len && memcmp(r->src, pat->chars, pat->len) == 0) return r;
+    }
+    Regex *re = calloc(1, sizeof(Regex));
+    re->src = xrealloc(NULL, pat->len + 1);
+    memcpy(re->src, pat->chars, pat->len + 1); re->srclen = pat->len;
+    RP rp = { (const unsigned char *)pat->chars, (const unsigned char *)pat->chars + pat->len, re, NULL };
+    if (pat->len >= 4 && memcmp(pat->chars, "(?i)", 4) == 0) { re->icase = 1; rp.p += 4; }
+    re->ncap = 1;
+    RNode *root = re_alt(&rp);
+    if (rp.p < rp.end) re_error("')' in più", "unexpected ')'");
+    /* registri: inizio e fine di ogni gruppo, poi uno per ogni ciclo */
+    re->nreg = 2 * re->ncap;
+    re_emit(re, I_SAVE, 0, 0);
+    re_compile(re, root);
+    re_emit(re, I_SAVE, 1, 0);
+    re_emit(re, I_MATCH, 0, 0);
+    for (RNode *n = rp.nodes, *nx; n; n = nx) { nx = n->next_alloc; free(n->k); free(n); }
+    Regex *old = re_cache[RE_CACHE - 1];
+    if (old) { if (old->busy) old->orphan = 1; else re_free(old); }
+    memmove(re_cache + 1, re_cache, (RE_CACHE - 1) * sizeof(Regex *));
+    re_cache[0] = re;
+    return re;
+}
+static long re_steps;
+
+/* minuscola, anche per le lettere accentate latine (À-Þ -> à-þ) */
+static long re_fold(long c) {
+    if (c < 128) return tolower((int)c);
+    if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return c + 0x20;
+    return c;
+}
+static long re_upper(long c) {
+    if (c < 128) return toupper((int)c);
+    if (c >= 0xE0 && c <= 0xFE && c != 0xF7) return c - 0x20;
+    return c;
+}
+/* Lettera o cifra: ASCII più tutti i caratteri non ASCII che non sono
+   punteggiatura o spazi comuni (così \w riconosce "perché", "Straße", "мир"). */
+static int re_wordcp(long c) {
+    if (c < 128) return isalnum((int)c) || c == '_';
+    if (c <= 0xBF || c == 0xD7 || c == 0xF7) return 0;          /* simboli Latin-1 */
+    if (c >= 0x2000 && c <= 0x206F) return 0;                    /* punteggiatura generale */
+    if (c >= 0x3000 && c <= 0x303F) return 0;                    /* punteggiatura CJK */
+    if (c == 0xFEFF || (c >= 0xFF00 && c <= 0xFF0F)) return 0;
+    return 1;
+}
+static int re_in_class(Regex *re, int ci, long c) {
+    RClass *k = &re->cls[ci];
+    int in = 0;
+    for (int i = 0; i < k->n && !in; i++) {
+        if (k->r[i].lo == -1) in = re_wordcp(c);
+        else if (c >= k->r[i].lo && c <= k->r[i].hi) in = 1;
+        else if (re->icase) {
+            long a = re_fold(c), b = re_upper(c);
+            in = (a >= k->r[i].lo && a <= k->r[i].hi) || (b >= k->r[i].lo && b <= k->r[i].hi);
+        }
+    }
+    return in != k->neg;
+}
+
+typedef struct { int pc; long pos, old; int reg; } RThread;
+
+/* Prova a riconoscere l'espressione partendo esattamente da "start".
+   regs riceve inizio/fine (in byte) di ogni gruppo; il gruppo 0 è tutto. */
+static int re_run(Regex *re, const unsigned char *s, long len, long start, long *regs) {
+    for (int i = 0; i < re->nreg; i++) regs[i] = -1;
+    RThread *st = NULL; int n = 0, cap = 0;
+#define RPUSH(PC, POS, REG, OLD) do { \
+        if (n == cap) { cap = cap ? cap * 2 : 64; st = xrealloc(st, cap * sizeof(RThread)); } \
+        st[n].pc = (PC); st[n].pos = (POS); st[n].reg = (REG); st[n].old = (OLD); n++; } while (0)
+    RPUSH(0, start, -1, 0);
+    while (n) {
+        RThread t = st[--n];
+        if (t.reg >= 0) { regs[t.reg] = t.old; continue; }
+        int pc = t.pc; long pos = t.pos;
+        for (;;) {
+            if (++re_steps > RE_MAX_STEPS) {
+                free(st);
+                re_error("espressione troppo lenta su questo testo", "expression too slow on this text");
+            }
+            RInst *in = &re->code[pc];
+            int ok = 1, l;
+            switch (in->op) {
+            case I_CHAR: {
+                if (pos >= len) { ok = 0; break; }
+                long c = u8dec(s + pos, s + len, &l);
+                if (c != in->x && !(re->icase && re_fold(c) == re_fold(in->x))) { ok = 0; break; }
+                pos += l; pc++;
+                break;
+            }
+            case I_ANY:
+                if (pos >= len || s[pos] == '\n') { ok = 0; break; }
+                u8dec(s + pos, s + len, &l); pos += l; pc++;
+                break;
+            case I_CLASS: {
+                if (pos >= len) { ok = 0; break; }
+                long c = u8dec(s + pos, s + len, &l);
+                if (!re_in_class(re, (int)in->x, c)) { ok = 0; break; }
+                pos += l; pc++;
+                break;
+            }
+            case I_SPLIT: RPUSH((int)in->y, pos, -1, 0); pc = (int)in->x; break;
+            case I_JMP: pc = (int)in->x; break;
+            case I_SAVE: RPUSH(0, 0, (int)in->x, regs[in->x]); regs[in->x] = pos; pc++; break;
+            case I_PROG: if (regs[in->x] == pos) ok = 0; else pc++; break;
+            case I_BOL: if (pos != 0) ok = 0; else pc++; break;
+            case I_EOL: if (pos != len) ok = 0; else pc++; break;
+            case I_WB: case I_NWB: {
+                int a = 0, b = 0;
+                if (pos > 0) {     /* carattere precedente: torna all'inizio della sequenza UTF-8 */
+                    long q = pos - 1;
+                    while (q > 0 && (s[q] & 0xC0) == 0x80) q--;
+                    a = re_wordcp(u8dec(s + q, s + len, &l));
+                }
+                if (pos < len) b = re_wordcp(u8dec(s + pos, s + len, &l));
+                if ((a != b) != (in->op == I_WB)) ok = 0; else pc++;
+                break;
+            }
+            case I_MATCH: free(st); return 1;
+            }
+            if (!ok) break;
+        }
+    }
+    free(st);
+    return 0;
+#undef RPUSH
+}
+
+/* Cerca la prima corrispondenza da "from" in poi. */
+static int re_exec(Regex *re, Str *s, long from, long *regs) {
+    const unsigned char *b = (const unsigned char *)s->chars;
+    long len = (long)s->len;
+    for (long pos = from; pos <= len; pos += pos < len ? u8len(b[pos]) : 1)
+        if (re_run(re, b, len, pos, regs)) return 1;
+    return 0;
+}
+
+static Value re_groups(Regex *re, Str *s, long *regs) {
+    Cell *c = cell_new();
+    for (int g = 0; g < re->ncap; g++)
+        cell_push(c, regs[2 * g] >= 0 && regs[2 * g + 1] >= 0
+                         ? VSTR(str_new(s->chars + regs[2 * g], regs[2 * g + 1] - regs[2 * g])) : VNIL);
+    return VCELL(c);
+}
+
+/* Avanza dopo una corrispondenza (di un carattere se era vuota). */
+static long re_next(Str *s, long *regs) {
+    if (regs[1] > regs[0]) return regs[1];
+    return regs[1] < (long)s->len ? regs[1] + u8len((unsigned char)s->chars[regs[1]]) : (long)s->len + 1;
+}
+
+/* re_match(testo, espressione): [tutto, gruppo1, gruppo2, ...] oppure nulla */
+NAT(n_re_match) {
+    Str *s = need_str(argc, argv, 0, "re_match");
+    Regex *re = re_get(need_str(argc, argv, 1, "re_match"));
+    long *regs = malloc(re->nreg * sizeof(long));
+    re_steps = 0;
+    Value r = re_exec(re, s, 0, regs) ? re_groups(re, s, regs) : VNIL;
+    free(regs);
+    return r;
+}
+/* re_find_all(testo, espressione): tutti i pezzi di testo trovati */
+NAT(n_re_find_all) {
+    Str *s = need_str(argc, argv, 0, "re_find_all");
+    Regex *re = re_get(need_str(argc, argv, 1, "re_find_all"));
+    long *regs = malloc(re->nreg * sizeof(long)), from = 0;
+    Cell *r = cell_new();
+    re_steps = 0;
+    while (from <= (long)s->len && re_exec(re, s, from, regs)) {
+        cell_push(r, VSTR(str_new(s->chars + regs[0], regs[1] - regs[0])));
+        from = re_next(s, regs);
+    }
+    free(regs);
+    return VCELL(r);
+}
+/* re_split(testo, espressione): i pezzi tra una corrispondenza e l'altra */
+NAT(n_re_split) {
+    Str *s = need_str(argc, argv, 0, "re_split");
+    Regex *re = re_get(need_str(argc, argv, 1, "re_split"));
+    long *regs = malloc(re->nreg * sizeof(long)), from = 0, last = 0;
+    Cell *r = cell_new();
+    re_steps = 0;
+    while (from <= (long)s->len && re_exec(re, s, from, regs)) {
+        if (regs[1] == regs[0] && (regs[0] == 0 || regs[0] == (long)s->len)) { from = re_next(s, regs); continue; }
+        cell_push(r, VSTR(str_new(s->chars + last, regs[0] - last)));
+        last = regs[1];
+        from = re_next(s, regs);
+    }
+    cell_push(r, VSTR(str_new(s->chars + last, s->len - last)));
+    free(regs);
+    return VCELL(r);
+}
+/* re_replace(testo, espressione, sostituto): il sostituto è un testo, dove
+   $0..$9 sono i gruppi e $$ è il simbolo $, oppure una funzione che riceve
+   [tutto, gruppo1, ...] e restituisce il testo da mettere al suo posto. */
+NAT(n_re_replace) {
+    Str *s = need_str(argc, argv, 0, "re_replace");
+    Regex *re = re_get(need_str(argc, argv, 1, "re_replace"));
+    Value with = ARG(2);
+    int is_fn = with.t == T_FUNC || with.t == T_NATIVE;
+    if (!is_fn) need_str(argc, argv, 2, "re_replace");
+    long *regs = malloc(re->nreg * sizeof(long)), from = 0, last = 0;
+    Buf b = { 0 };
+    re->busy++;
+    re_steps = 0;
+    while (from <= (long)s->len && re_exec(re, s, from, regs)) {
+        buf_put(&b, s->chars + last, regs[0] - last);
+        if (is_fn) {
+            Value a[1] = { re_groups(re, s, regs) };
+            long saved[20]; int ns = re->nreg < 20 ? re->nreg : 20;
+            memcpy(saved, regs, ns * sizeof(long));
+            Value out = tostr(call_value(with, 1, a, VNIL, 0));
+            memcpy(regs, saved, ns * sizeof(long));
+            buf_put(&b, AS_STR(out)->chars, AS_STR(out)->len);
+        } else {
+            Str *w = AS_STR(with);
+            for (size_t i = 0; i < w->len; i++) {
+                if (w->chars[i] == '$' && i + 1 < w->len) {
+                    char d = w->chars[i + 1];
+                    if (d == '$') { buf_putc(&b, '$'); i++; continue; }
+                    if (isdigit((unsigned char)d)) {
+                        int g = d - '0';
+                        if (g < re->ncap && regs[2 * g] >= 0) buf_put(&b, s->chars + regs[2 * g], regs[2 * g + 1] - regs[2 * g]);
+                        i++;
+                        continue;
+                    }
+                }
+                buf_putc(&b, w->chars[i]);
+            }
+        }
+        last = regs[1];
+        from = re_next(s, regs);
+    }
+    buf_put(&b, s->chars + last, s->len - last);
+    free(regs);
+    if (--re->busy == 0 && re->orphan) re_free(re);
+    return vbuf(&b);
+}
+
 static const struct { const char *en, *it; NativeFn fn; } NATIVES[] = {
     { "print", "stampa", n_print }, { "write", "scrivi", n_write }, { "input", "chiedi", n_input },
     { "str", "testo", n_str }, { "num", "numero", n_num }, { "type", NULL, n_type }, { "tipo", NULL, n_tipo }, { "language", "lingua", n_lang },
@@ -2640,6 +3556,17 @@ static const struct { const char *en, *it; NativeFn fn; } NATIVES[] = {
     { "error", "errore", n_error }, { "try", "prova", n_try }, { "assert", "verifica", n_assert },
     { "read_file", "leggi_file", n_read_file }, { "write_file", "scrivi_file", n_write_file },
     { "import", "importa", n_import }, { "eval", "esegui", n_eval },
+    { "format", "formatta", n_format }, { "pad_left", "riempi_sinistra", n_pad_left },
+    { "pad_right", "riempi_destra", n_pad_right }, { "starts_with", "inizia_con", n_starts_with },
+    { "ends_with", "finisce_con", n_ends_with }, { "seed", "seme", n_seed }, { "insert", "inserisci", n_insert },
+    { "unique", "unici", n_unique }, { "flatten", "appiattisci", n_flatten },
+    { "deep_copy", "copia_profonda", n_deep_copy }, { "range", "intervallo", n_range },
+    { "date", NULL, n_date }, { "data", NULL, n_data }, { "format_date", "formatta_data", n_format_date },
+    { "sleep", "aspetta", n_sleep }, { "env", "ambiente", n_env }, { "eprint", "stampa_errore", n_eprint },
+    { "exists", "esiste", n_exists }, { "is_dir", "è_cartella", n_is_dir },
+    { "remove_file", "cancella_file", n_remove_file }, { "list_dir", "elenca", n_list_dir },
+    { "re_match", "cerca_re", n_re_match }, { "re_find_all", "trova_tutti_re", n_re_find_all },
+    { "re_replace", "sostituisci_re", n_re_replace }, { "re_split", "dividi_re", n_re_split },
     { "chr", "carattere", n_chr }, { "to_json", "in_json", n_to_json }, { "from_json", "da_json", n_from_json }, { "ord", "codice", n_ord }, { "exit", "esci", n_exit },
 };
 
@@ -2779,7 +3706,7 @@ static void usage(void) {
            "     senza file parte la modalità interattiva; '-' legge il programma dallo standard input\n"
            "\n"
            "  -e CODICE                esegue il codice indicato\n"
-           "  --protetto, --sandbox    niente file, importa() ed esci()\n"
+           "  --protetto, --sandbox    niente file, cartelle, importa(), ambiente(), aspetta(), esci()\n"
            "  --passi N, --steps N     al massimo N istruzioni eseguite\n"
            "  --tempo S, --time S      al massimo S secondi di calcolo\n"
            "  --memoria M, --memory M  al massimo M megabyte di memoria (circa)\n"
@@ -2790,7 +3717,7 @@ static void usage(void) {
            "       without a file it starts interactive mode; '-' reads the program from standard input\n"
            "\n"
            "  -e CODE                  run CODE\n"
-           "  --sandbox, --protetto    no files, import() or exit()\n"
+           "  --sandbox, --protetto    no files, folders, import(), env(), sleep(), exit()\n"
            "  --steps N, --passi N     run at most N statements\n"
            "  --time S, --tempo S      use at most S seconds of CPU time\n"
            "  --memory M, --memoria M  use at most about M megabytes of memory\n"

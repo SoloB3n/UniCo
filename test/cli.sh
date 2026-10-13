@@ -23,6 +23,13 @@ check "catena di chiamate"    "in f, chiamata alla riga 2" $U -e 'fn f() = 1 + n
 f()'
 check "graffa nel testo"      "usa \\{"            $U -e 'print("{")'
 check "stdin e argomenti"     '["a", "b"]'         sh -c "echo 'print(ARGS)' | $U - a b"
+check "protetto: env"         "modalità protetta"  $U --sandbox -e 'env("HOME")'
+check "protetto: elenca"      "modalità protetta"  $U --sandbox -e 'list_dir(".")'
+check "protetto: aspetta"     "modalità protetta"  $U --sandbox -e 'sleep(1)'
+check "protetto: cancella"    "modalità protetta"  $U --sandbox -e 'remove_file("x")'
+check "protetto: regex ok"    '["1"]'              $U --sandbox -e 'print(re_find_all("a1", "\\d"))'
+check "aiuto sulla graffa"    "usa \\{"          $U -e 'print("{m,n}")'
+check "stderr"                "su stderr"          sh -c "$U -e 'eprint(\"su stderr\")' 2>&1 >/dev/null"
 check "messaggi in inglese"   "undefined name"     $U --lang en -e 'x'
 check "inglese da ambiente"   "step limit"         env UNICO_LANG=en $U --steps 10 -e 'while true { }'
 check "inglese: stampa"       "true nil"           $U --lang en -e 'print(vero, nulla)'
